@@ -125,6 +125,202 @@ def test_source_reliability_policy_fields_are_attached():
     assert "independent traction verification" in item["disallowed_uses"]
 
 
+def test_source_tier_allowlist_and_denylist_policy():
+    evidence = normalize_evidence(
+        [
+            {
+                "title": "Acme announces Series B",
+                "url": "https://www.businesswire.com/news/home/acme-series-b",
+                "snippet": "Official press release announcing Acme's financing.",
+                "query": "Acme funding investors news",
+                "evidence_type": "funding",
+                "confidence": 0.86,
+            },
+            {
+                "title": "Acme SEC filing",
+                "url": "https://www.sec.gov/Archives/edgar/data/acme",
+                "snippet": "Government filing for Acme.",
+                "query": "Acme SEC filing",
+                "evidence_type": "news",
+                "confidence": 0.9,
+            },
+            {
+                "title": "Top 10 Best Acme Alternatives",
+                "url": "https://bestsoftware.example/acme-alternatives",
+                "snippet": "SEO listicle comparing software tools.",
+                "query": "Acme competitors alternatives",
+                "evidence_type": "competitor",
+                "confidence": 0.9,
+            },
+        ]
+    )
+    by_title = {item["title"]: item for item in evidence}
+    assert by_title["Acme announces Series B"]["source_tier"] == 1
+    assert by_title["Acme SEC filing"]["source_tier"] == 1
+    assert by_title["Top 10 Best Acme Alternatives"]["source_tier"] == 3
+    assert by_title["Top 10 Best Acme Alternatives"]["source_type"] == "vendor_blog"
+    assert by_title["Top 10 Best Acme Alternatives"]["allowed_uses"] == ["competitor discovery", "market vocabulary", "feature vocabulary"]
+
+
+def test_founder_name_from_partner_notes_is_preserved_without_hallucination():
+    notes = (
+        "Met Acme AI. Founder Jane Doe previously led product at a workflow software company. "
+        "Platform for operations teams. Need to understand buyer, competition, and retention."
+    )
+    state = run_sequential_graph(notes, search_provider="mock")
+    founding_team = state["memo_json"]["founding_team"]
+    assert founding_team["status"] == "Found"
+    assert founding_team["people"][0]["name"] == "Jane Doe"
+    assert founding_team["people"][0]["source"] == "Partner Notes"
+    assert "Jane Doe" in state["memo_markdown"]
+
+
+def test_founder_name_from_public_leadership_source_is_preliminary():
+    notes = "Met Acme AI. Workflow platform for operations teams. Need to verify founder."
+    state = {"raw_notes": notes, "trace": []}
+    state.update(extract_company_profile(state))
+    state.update(
+        {
+            "search_results": [
+                {
+                    "title": "Jane Doe | LinkedIn",
+                    "url": "https://www.linkedin.com/in/jane-doe",
+                    "snippet": "Jane Doe is co-founder and CEO of Acme AI.",
+                    "query": "Acme AI founder leadership team",
+                    "evidence_type": "leadership",
+                    "confidence": 0.72,
+                }
+            ]
+        }
+    )
+    state.update(build_evidence_store(state))
+    state.update(refine_company_profile_from_evidence(state))
+    state.update(write_structured_memo(state))
+    founding_team = state["memo_json"]["founding_team"]
+    assert founding_team["status"] == "Found"
+    assert founding_team["people"][0]["name"] == "Jane Doe"
+    assert founding_team["people"][0]["source"] == "Public Evidence"
+    assert founding_team["people"][0]["source_ids"]
+    assert founding_team["people"][0]["verification_status"] == "Single public source - requires corroboration"
+
+
+def test_founder_name_from_official_website_source_is_extracted():
+    notes = "Met Acme AI. Workflow platform for operations teams. Need to verify founder."
+    state = {"raw_notes": notes, "trace": []}
+    state.update(extract_company_profile(state))
+    state.update(
+        {
+            "search_results": [
+                {
+                    "title": "About Acme AI | Official Website",
+                    "url": "https://www.acme.ai/about",
+                    "snippet": "Acme AI was founded by Jane Doe and John Smith to automate operations workflows.",
+                    "query": "Acme AI official website",
+                    "evidence_type": "website",
+                    "confidence": 0.88,
+                }
+            ]
+        }
+    )
+    state.update(build_evidence_store(state))
+    state.update(refine_company_profile_from_evidence(state))
+    state.update(write_structured_memo(state))
+    names = {person["name"] for person in state["memo_json"]["founding_team"]["people"]}
+    assert {"Jane Doe", "John Smith"} <= names
+    assert state["memo_json"]["founding_team"]["source_ids"] == ["S1"]
+    for person in state["memo_json"]["founding_team"]["people"]:
+        assert person["verification_status"] == "Single public source - requires corroboration"
+
+
+def test_founder_name_is_verified_when_multiple_sources_agree():
+    notes = "Met Acme AI. Workflow platform for operations teams. Need to verify founder."
+    state = {"raw_notes": notes, "trace": []}
+    state.update(extract_company_profile(state))
+    state.update(
+        {
+            "search_results": [
+                {
+                    "title": "About Acme AI | Official Website",
+                    "url": "https://www.acme.ai/about",
+                    "snippet": "Acme AI was founded by Jane Doe to automate operations workflows.",
+                    "query": "Acme AI about founders leadership team official",
+                    "evidence_type": "leadership",
+                    "confidence": 0.88,
+                },
+                {
+                    "title": "Acme AI Company Profile",
+                    "url": "https://www.crunchbase.com/organization/acme-ai",
+                    "snippet": "Jane Doe is listed as founder and CEO of Acme AI.",
+                    "query": "Acme AI founders Crunchbase CEO",
+                    "evidence_type": "leadership",
+                    "confidence": 0.82,
+                },
+            ]
+        }
+    )
+    state.update(build_evidence_store(state))
+    state.update(refine_company_profile_from_evidence(state))
+    state.update(write_structured_memo(state))
+    founding_team = state["memo_json"]["founding_team"]
+    jane = next(person for person in founding_team["people"] if person["name"] == "Jane Doe")
+    assert jane["verification_status"] == "Verified by multiple public sources"
+    assert jane["confidence"] == "High"
+    assert set(jane["source_ids"]) == {"S1", "S2"}
+    assert founding_team["verified_count"] == 1
+
+
+def test_founders_and_leadership_title_is_not_extracted_as_person_name():
+    notes = "Met Acme AI. Workflow platform for operations teams. Need to verify founder."
+    state = {"raw_notes": notes, "trace": []}
+    state.update(extract_company_profile(state))
+    state.update(
+        {
+            "search_results": [
+                {
+                    "title": "Founders and Leadership | Acme AI",
+                    "url": "https://www.acme.ai/team",
+                    "snippet": "Learn more about Acme AI leadership and company history.",
+                    "query": "Acme AI founder CEO leadership official LinkedIn",
+                    "evidence_type": "leadership",
+                    "confidence": 0.8,
+                }
+            ]
+        }
+    )
+    state.update(build_evidence_store(state))
+    state.update(refine_company_profile_from_evidence(state))
+    state.update(write_structured_memo(state))
+    founding_team = state["memo_json"]["founding_team"]
+    assert founding_team["status"] == "Unknown"
+    assert all(person["name"] != "And Leadership" for person in founding_team["people"])
+
+
+def test_founding_team_unknown_when_no_supported_person_name_exists():
+    notes = "Met Atlas. AI platform helping enterprises make better decisions. Need to understand product and buyer."
+    state = run_sequential_graph(notes, search_provider="mock")
+    founding_team = state["memo_json"]["founding_team"]
+    assert founding_team["status"] == "Unknown"
+    assert founding_team["people"] == []
+
+
+def test_unknown_blogs_are_low_trust_context_only():
+    evidence = normalize_evidence(
+        [
+            {
+                "title": "Acme buyer guide ultimate review",
+                "url": "https://unknown-blog.example/acme-review",
+                "snippet": "Generic buyer guide content with SEO-style rankings.",
+                "query": "Acme market context",
+                "evidence_type": "market",
+                "confidence": 0.72,
+            }
+        ]
+    )
+    assert evidence[0]["source_tier"] == 3
+    assert evidence[0]["source_quality"] == "low"
+    assert evidence[0]["source_type"] == "generic_blog"
+
+
 def test_funding_evidence_does_not_verify_traction_without_operating_metrics():
     from src.nodes import _partner_claims
 
@@ -222,6 +418,26 @@ def test_low_confidence_sources_cannot_raise_section_to_high_confidence():
     assert _section_confidence(evidence, "market", has_notes=False) == "Low"
 
 
+def test_risk_taxonomy_does_not_render_rows_without_public_sources():
+    from src.render import render_risk_taxonomy
+
+    lines = render_risk_taxonomy(
+        {
+            "risk_taxonomy": {
+                "summary": "Risks require public evidence before full-report rendering.",
+                "rows": [
+                    {
+                        "risk_category": "Adoption risk",
+                        "description": "Note-derived risk only.",
+                        "source_ids": [],
+                    }
+                ],
+            }
+        }
+    )
+    assert lines == []
+
+
 def test_partner_verification_and_scorecard_render_as_tables():
     state = run_sequential_graph(SAMPLE_NOTES, search_provider="mock")
     markdown = state["memo_markdown"]
@@ -229,31 +445,34 @@ def test_partner_verification_and_scorecard_render_as_tables():
     assert "| Topic | Evidence Quality | Tier 1 | Tier 2 | Tier 3 | Weighted Score |" in markdown
     assert "## Evidence Coverage" in markdown
     assert "| Category | Coverage | Status | Confidence | Coverage Bar |" in markdown
+    assert "## Claim Verification" in markdown
+    assert "| Claim Area | Status | Claim | Sources | Diligence Follow-up |" in markdown
     assert "## Can We Make A Decision Yet?" in markdown
     assert "## Critical Missing Information" in markdown
     assert "## Decision Blocking Unknowns" in markdown or "**Blocking Unknowns**" in markdown
-    assert "## Known / Unknown By Section" in markdown
-    assert "## Claim Verification" in markdown
-    assert "| Claim Area | Status | Claim | Sources | Diligence Follow-up |" in markdown
     assert "## Investment Scorecard" in markdown
     assert "| Category | Rating | Evidence Strength | Reason | Key Diligence Gap | Sources |" in markdown
     assert "## Investment Thesis Framework" in markdown
     assert "| Investor Question | Answer | Evidence Strength | Sources | Key Diligence Gap |" in markdown
-    assert "## Defensibility Framework" in markdown
-    assert "| Potential Moat | Current Evidence | Diligence Needed | Risk | Sources |" in markdown
     assert "## Competitive Landscape" in markdown
-    assert "| Competitor Group | Examples | Why It Competes | Buyer Overlap | Workflow Overlap | Budget Overlap | Threat Level | Evidence Quality | Sources |" in markdown
-    assert "## Traction Analysis" in markdown
-    assert "## Business Model Analysis" in markdown
-    assert "## Risk Taxonomy" in markdown
-    assert "## Partner Claim Verification Graph" in markdown
+    assert markdown.count("## Competitive Landscape") == 1
+    assert "| Company | Similarity | Buyer | Workflow | Replacement Target | Differentiation Factors | Funding / Scale | Revenue Evidence | Score | Sources |" in markdown
     assert "## Partner Claim Verification Table" in markdown
     assert "| Partner Claim | Public Evidence Found | Status | Sources | Diligence Follow-up |" in markdown
-    assert "## Risk Breakdown Graph" in markdown
-    assert "| Risk | Type | Score | Confidence | Why It Matters | Evidence |" in markdown
-    assert "## Bull Case vs Bear Case Chart" in markdown
     assert "## What Needs To Be True" in markdown
-    assert "| Company | Buyer | Workflow | Threat Level | Competitor Score | Why It Competes | Sources |" in markdown
+    assert "| Company | Similarity | Buyer | Workflow | Replacement Target | Differentiation Factors | Funding / Scale | Revenue Evidence | Score | Sources |" in markdown
+    for removed in [
+        "**Factor Evidence Notes**",
+        "## Known / Unknown By Section",
+        "## Partner Claim Verification Graph",
+        "## Risk Breakdown Graph",
+        "## Bull Case vs Bear Case Chart",
+        "## Section Confidence",
+        "## Memo Validator",
+        "## Business Model Analysis",
+        "## Company Identity Resolution",
+    ]:
+        assert removed not in markdown
 
 
 def test_investment_thesis_framework_answers_core_questions():
@@ -528,7 +747,8 @@ def test_claim_verification_keeps_customer_adoption_cautious_without_operating_m
     assert "paid usage" in traction["claim"]
     assert "retention" in traction["claim"]
     assert "Funding" not in traction["rationale"]
-    assert "pilots, paid deployments, active usage, expansion, and renewal behavior" in state["memo_markdown"]
+    assert "pilots, paid deployments, active usage, expansion, and renewal behavior" in traction["diligence_follow_up"]
+    assert "## Claim Verification" in state["memo_markdown"]
 
 
 def test_claim_verification_flags_conflicting_product_evidence():
@@ -603,11 +823,11 @@ def test_visualization_ratings_include_unknown_guardrails():
             assert row["score"] == round(sum(known_factor_scores) / len(known_factor_scores), 1)
 
 
-def test_scorecard_factor_breakdown_is_rendered():
+def test_scorecard_factor_breakdown_is_not_rendered_in_full_report():
     state = run_sequential_graph(SAMPLE_NOTES, search_provider="mock")
     markdown = state["memo_markdown"]
-    assert "**Factor Evidence Notes**" in markdown
-    assert "| Category | Factor | Evidence Signal | Reason | Sources |" in markdown
+    assert "**Factor Evidence Notes**" not in markdown
+    assert "| Category | Factor | Evidence Signal | Reason | Sources |" not in markdown
     assert "Investment Score:" not in markdown
     assert "Factor Score" not in markdown
 
@@ -971,7 +1191,7 @@ def test_broad_platform_memo_explains_use_cases_and_diligence_needed():
     assert "appears to provide a broad platform" in markdown
     assert "public evidence suggests use cases including" in markdown
     assert "exact initial wedge and usage mix require diligence" in markdown
-    assert "| primary product scope | broad_platform |" in markdown
+    assert state["memo_json"]["company_understanding"]["primary_product_scope"] == "broad_platform"
 
 
 def test_new_industry_taxonomies_generate_specific_profiles_and_risks():
@@ -1303,7 +1523,8 @@ def test_ambiguous_nimbus_with_clear_notes_runs_workflow_level_diligence():
     assert "workflow-level market, risk, and competitor diligence" in state["memo_json"]["recommendation"]["reason"]
     risk_names = [risk["risk_name"] for risk in state["memo_json"]["visualizations"]["risk_breakdown"]["risks"]]
     assert "Clinical adoption risk" in risk_names
-    assert "## Company Identity Resolution" in state["memo_markdown"] or state["memo_json"]["identity_resolution"]["message"] == "Unable to confidently identify company."
+    assert "## Company Identity Resolution" not in state["memo_markdown"]
+    assert state["memo_json"]["identity_resolution"]["message"] == "Unable to confidently identify company."
 
 
 def test_low_understanding_still_runs_identity_discovery_research():
@@ -1429,7 +1650,7 @@ def test_irrelevant_search_results_are_filtered_from_evidence():
                 "title": "Product design software market context",
                 "url": "https://example.com/product-design-market",
                 "snippet": "Collaborative design platforms support prototyping, design systems, and developer handoff workflows.",
-                "query": "CanvasForge collaborative design platform market context product design",
+                "query": "CanvasForge collaborative design prototyping design systems market context",
                 "evidence_type": "market",
                 "confidence": 0.75,
             },
@@ -1437,6 +1658,209 @@ def test_irrelevant_search_results_are_filtered_from_evidence():
     )
     assert len(evidence) == 1
     assert evidence[0]["title"] == "Product design software market context"
+
+
+def test_sparse_known_company_notes_can_be_resolved_from_public_website_evidence():
+    notes = "Met Elevan Labs. Need to understand product, buyer, competition, revenue model, and retention."
+    state = {
+        "raw_notes": notes,
+        "company_profile": {},
+        "research_plan": [],
+        "search_results": [
+            {
+                "title": "ElevenLabs | Text to Speech, Voice AI, and Dubbing",
+                "url": "https://elevenlabs.io/",
+                "snippet": "ElevenLabs is a voice AI platform for text-to-speech, voice generation, dubbing, and speech workflows for creators, developers, and enterprises.",
+                "query": "Elevan Labs official website",
+                "evidence_type": "website",
+                "confidence": 0.9,
+            }
+        ],
+        "evidence": [],
+        "memo_json": {},
+        "chart_data": {},
+        "validation": {"is_valid": False, "unsupported_claims": [], "warnings": [], "source_coverage": {}},
+        "memo_markdown": "",
+        "errors": [],
+        "trace": [],
+    }
+    for step in [extract_company_profile, plan_research, validate_company_understanding, build_evidence_store, refine_company_profile_from_evidence, write_structured_memo]:
+        state.update(step(state))
+
+    understanding = state["memo_json"]["company_understanding"]
+    assert state["memo_json"]["identity_resolution"]["is_resolved"]
+    assert understanding["category"] == "Voice / Audio AI"
+    assert "voice AI platform" in understanding["primary_product"]
+    assert understanding["target_buyer"] != "Unknown"
+    assert understanding["core_workflow"] != "Unknown"
+    assert "Unable to confidently identify company or understand workflow." not in state["errors"]
+    assert "Do Not Advance Yet - Resolve Company Identity" != state["memo_json"]["recommendation"]["decision"]
+
+
+def test_unknown_taxonomy_company_gets_generic_public_evidence_fallback():
+    notes = "Met QuantaLoop. Need to understand product, buyer, competition, revenue model, and retention."
+    state = {
+        "raw_notes": notes,
+        "company_profile": {},
+        "research_plan": [],
+        "search_results": [
+            {
+                "title": "QuantaLoop | Official Website",
+                "url": "https://quantaloom.example/",
+                "snippet": "QuantaLoop provides a telemetry platform for field service teams to monitor equipment uptime and automate maintenance workflows.",
+                "query": "QuantaLoop official website",
+                "evidence_type": "website",
+                "confidence": 0.88,
+            }
+        ],
+        "evidence": [],
+        "memo_json": {},
+        "chart_data": {},
+        "validation": {"is_valid": False, "unsupported_claims": [], "warnings": [], "source_coverage": {}},
+        "memo_markdown": "",
+        "errors": [],
+        "trace": [],
+    }
+    for step in [extract_company_profile, plan_research, validate_company_understanding, build_evidence_store, refine_company_profile_from_evidence, write_structured_memo, generate_chart_data]:
+        state.update(step(state))
+
+    understanding = state["memo_json"]["company_understanding"]
+    assert state["memo_json"]["identity_resolution"]["is_resolved"]
+    assert understanding["category"] == "Other / Emerging Software"
+    assert "telemetry platform" in understanding["primary_product"]
+    assert understanding["target_buyer"] != "Unknown"
+    assert understanding["core_workflow"] != "Unknown"
+    assert state["chart_data"]["competitive_table"]
+    assert "Do Not Advance Yet - Resolve Company Identity" != state["memo_json"]["recommendation"]["decision"]
+
+
+def test_data_ai_platform_notes_generate_note_anchor_and_downstream_understanding():
+    notes = """
+    Met Databricks.
+
+    Data and AI platform.
+
+    Strong enterprise footprint.
+
+    Interesting because AI workloads continue increasing.
+
+    Need to understand:
+    - Snowflake competition
+    - Expansion economics
+    - Open-source strategy
+    - Margins
+    """
+    state = run_sequential_graph(notes, search_provider="mock")
+    note_anchor = state["memo_json"]["company_understanding"]["note_anchor"]
+    understanding = state["memo_json"]["company_understanding"]
+    diligence_text = str(state["memo_json"]["next_diligence_priorities"]).lower()
+
+    assert note_anchor["product_description"] != "Unknown"
+    assert "data and AI platform" in note_anchor["product_description"]
+    assert note_anchor["target_customer"] != "Unknown"
+    assert note_anchor["core_workflow"] != "Unknown"
+    assert "Snowflake competition" in note_anchor["key_diligence_questions"]
+    assert understanding["category"] == "Data / AI Infrastructure"
+    assert "data engineering" in understanding["core_workflow"]
+    assert "Snowflake" in understanding["competitors"]
+    assert "snowflake" in diligence_text
+    assert "open-source" in diligence_text or "open source" in diligence_text
+    assert "gross margin" in diligence_text or "margins" in diligence_text
+
+
+def test_fuzzy_relevance_keeps_typo_matched_official_company_result():
+    evidence = normalize_evidence(
+        [
+            {
+                "title": "ElevenLabs | Text to Speech and Voice AI",
+                "url": "https://elevenlabs.io/",
+                "snippet": "ElevenLabs provides text-to-speech, voice generation, and dubbing tools.",
+                "query": "Elevan Labs official website",
+                "evidence_type": "website",
+                "confidence": 0.9,
+            }
+        ]
+    )
+    assert len(evidence) == 1
+    assert evidence[0]["title"].startswith("ElevenLabs")
+
+
+def test_workspace_productivity_notes_do_not_require_identity_resolution():
+    notes = (
+        "Met Notion. Workspace and productivity platform. Strong product affinity. "
+        "Need to understand enterprise penetration, Microsoft competition, retention."
+    )
+    state = run_sequential_graph(notes, search_provider="mock")
+    understanding = state["memo_json"]["company_understanding"]
+    why_now = state["memo_json"]["thesis_framework"]["why_now"]["answer"].lower()
+    diligence_text = str(state["memo_json"]["next_diligence_priorities"]).lower()
+    recommendation = state["memo_json"]["recommendation"]["decision"]
+
+    assert state["memo_json"]["identity_resolution"]["is_resolved"]
+    assert "cybersecurity" not in understanding["primary_product"].lower()
+    assert understanding["category"] == "Workspace / Productivity Software"
+    assert "connected workspace" in understanding["primary_product"].lower()
+    assert understanding["target_buyer"] != "Unknown"
+    assert understanding["core_workflow"] != "Unknown"
+    assert "workspace consolidation" in why_now
+    assert "ai-native knowledge work" in why_now
+    assert "enterprise penetration" in diligence_text
+    assert "microsoft competition" in diligence_text
+    assert "retention" in diligence_text
+    assert "Resolve Company Identity" not in recommendation
+    competitor_rows = state["chart_data"]["competitive_table"]
+    direct = [row for row in competitor_rows if row.get("competitor_score") is not None][:4]
+    assert direct
+    assert len({row["workflow"] for row in direct}) > 1
+    assert len({row["replacement_target"] for row in direct}) > 1
+    assert len({row["differentiation_factors"] for row in direct}) > 1
+    for row in direct:
+        assert row["buyer"] != "Unknown"
+        assert row["workflow"] != "Unknown"
+        assert row["budget_owner"] != "Unknown"
+        assert row["replacement_target"] != "Unknown"
+        assert row["job_to_be_done"] != "Requires validation."
+        assert row["similarity_tier"] in {
+            "Direct / high similarity",
+            "Adjacent / medium similarity",
+            "Incumbent or replacement workflow",
+            "Requires validation",
+        }
+        assert row["differentiation_factors"] != "Requires validation."
+        assert row["funding_info"]
+        assert row["revenue_available"]
+
+
+def test_security_evidence_is_noisy_enrichment_not_workspace_product_category():
+    notes = "Met WorkCanvas. Workspace and productivity platform for teams. Need to understand enterprise security and retention."
+    state = {
+        "raw_notes": notes,
+        "company_profile": {},
+        "research_plan": [],
+        "search_results": [
+            {
+                "title": "WorkCanvas security and compliance overview",
+                "url": "https://example.com/workcanvas-security",
+                "snippet": "Enterprise customers evaluate SOC 2, security controls, compliance posture, access controls, and audit readiness.",
+                "query": "WorkCanvas enterprise security compliance",
+                "evidence_type": "website",
+                "confidence": 0.8,
+            }
+        ],
+        "evidence": [],
+        "memo_json": {},
+        "chart_data": {},
+        "validation": {"is_valid": False, "unsupported_claims": [], "warnings": [], "source_coverage": {}},
+        "memo_markdown": "",
+        "errors": [],
+        "trace": [],
+    }
+    for step in [extract_company_profile, build_evidence_store, refine_company_profile_from_evidence]:
+        state.update(step(state))
+    understanding = state["company_profile"]["company_understanding"]
+    assert understanding["category"] == "Workspace / Productivity Software"
+    assert "cybersecurity" not in understanding["primary_product"].lower()
+    assert state["company_profile"]["public_enrichment_quality"]["status"] in {"usable", "noisy"}
 
 
 def test_unknown_category_does_not_emit_industry_specific_risks():
@@ -1505,7 +1929,8 @@ def test_conflicting_positioning_escalates_and_blocks_fallback_templates():
     assert understanding["validation"]["confidence"] <= 0.3
     assert state["memo_json"]["recommendation"]["decision"] == "Clarify Positioning Before Workflow-Level Analysis"
     assert "Conflicting signals detected" in state["memo_markdown"]
-    assert "Interpretation 1" in state["memo_markdown"]
+    assert "Interpretation 1" not in state["memo_markdown"]
+    assert contradiction["interpretations"]
     assert state["evidence"] == []
 
     memo_text = state["memo_markdown"].lower()
@@ -1539,8 +1964,8 @@ def test_note_explicit_radiology_risks_are_generated_without_resolved_identity()
     assert by_name["PACS/RIS/EHR integration risk"]["risk_type"] == "note_explicit"
     assert by_name["Data privacy and security risk"]["risk_type"] == "note_explicit"
     assert any(risk["risk_type"] == "workflow_inferred" for risk in risks)
-    assert "## Risk Breakdown Graph" in state["memo_markdown"]
-    assert "| Risk | Type | Score | Confidence | Why It Matters | Evidence |" in state["memo_markdown"]
+    assert "## Risk Breakdown Graph" not in state["memo_markdown"]
+    assert "| Risk | Type | Score | Confidence | Why It Matters | Evidence |" not in state["memo_markdown"]
 
 
 def test_abridge_competitors_prioritize_same_workflow_buyer_and_category():
@@ -1614,8 +2039,8 @@ def test_ramp_company_understanding_drives_domain_specific_memo():
     assert "Card spend" in understanding["revenue_drivers"]
 
     markdown = state["memo_markdown"]
-    assert "## Company Understanding" in markdown
     assert "CFOs and finance teams" in markdown
+    assert "## Company Understanding" not in markdown
     assert "HIPAA" not in markdown
     assert "clinical workflow" not in markdown.lower()
     assert "healthcare procurement" not in markdown.lower()
@@ -1672,3 +2097,33 @@ def test_ramp_competitor_discovery_uses_economic_overlap_not_keywords():
     assert all(row["competitor_score"] >= 6 for row in table if row["competitor_score"] is not None)
     assert any(row["category"] == "Direct Competitors" and row["threat_level"].startswith("High") for row in table)
     assert all("budget" in row["why_it_competes"].lower() for row in table)
+    assert all("similarity_tier" in row for row in table)
+    assert all("differentiation_factors" in row for row in table)
+    assert all("funding_info" in row for row in table)
+    assert all("revenue_available" in row for row in table)
+    top_rows = [row for row in table if row.get("competitor_score") is not None][:5]
+    assert len({row["workflow"] for row in top_rows}) > 1
+    assert len({row["replacement_target"] for row in top_rows}) > 1
+    assert len({row["differentiation_factors"] for row in top_rows}) > 1
+
+
+def test_defense_competitive_table_uses_specific_buyer_workflow_and_replacement_context():
+    notes = (
+        "Met Anduril. Defense technology company building autonomous systems, sensors, and mission software "
+        "for military and government buyers. Need to understand procurement, prime competition, program concentration, "
+        "field reliability, and revenue quality."
+    )
+    state = run_sequential_graph(notes, search_provider="mock")
+    markdown = state["memo_markdown"]
+    assert "Competitors are prioritized by same workflow" not in markdown
+    assert markdown.count("## Competitive Landscape") == 1
+
+    table = [row for row in state["chart_data"]["competitive_table"] if row.get("competitor_score") is not None][:5]
+    assert {row["company"] for row in table} >= {"Shield AI", "General Atomics", "Palantir"}
+    assert all("CFOs and finance teams" not in row["buyer"] for row in table)
+    assert all("supply chain" not in row["buyer"].lower() for row in table)
+    assert all("existing tools and manual workflows" not in row["replacement_target"] for row in table)
+    assert len({row["buyer"] for row in table}) > 1
+    assert len({row["workflow"] for row in table}) > 1
+    assert len({row["replacement_target"] for row in table}) > 1
+    assert len({row["differentiation_factors"] for row in table}) > 1

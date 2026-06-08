@@ -75,26 +75,6 @@ def render_investment_scorecard_graph(memo: dict) -> list[str]:
             + " |"
         )
     lines.append("")
-    lines.extend(["**Factor Evidence Notes**", ""])
-    lines.append("| Category | Factor | Evidence Signal | Reason | Sources |")
-    lines.append("| --- | --- | --- | --- | --- |")
-    for row in scorecard.get("raw_scores", []):
-        for factor in row.get("factors", []):
-            signal = "Known" if factor.get("score") is not None else "Unknown"
-            lines.append(
-                "| "
-                + " | ".join(
-                    [
-                        _escape_table(row.get("dimension", "")),
-                        _escape_table(factor.get("name", "")),
-                        _escape_table(signal),
-                        _escape_table(factor.get("reason", "")),
-                        _escape_table(_source_ids_label(factor.get("source_ids", []))),
-                    ]
-                )
-                + " |"
-            )
-    lines.append("")
     return lines
 
 
@@ -402,23 +382,6 @@ def render_missing_data(memo: dict) -> list[str]:
                 )
             lines.append("")
 
-    lines.extend(["## Known / Unknown By Section", ""])
-    lines.append("| Section | Status | Known | Unknown |")
-    lines.append("| --- | --- | --- | --- |")
-    for row in missing.get("section_status", []):
-        lines.append(
-            "| "
-            + " | ".join(
-                [
-                    _escape_table(row.get("section", "")),
-                    _escape_table(row.get("status", "")),
-                    _escape_table(", ".join(row.get("known", [])) or "None"),
-                    _escape_table(", ".join(row.get("unknown", [])) or "None"),
-                ]
-            )
-            + " |"
-        )
-    lines.append("")
     return lines
 
 
@@ -495,7 +458,11 @@ def render_thesis_framework(memo: dict) -> list[str]:
 
 def render_defensibility_framework(memo: dict) -> list[str]:
     framework = memo.get("defensibility_framework", {})
-    rows = framework.get("rows", [])
+    rows = [
+        row
+        for row in framework.get("rows", [])
+        if row.get("source_ids") and str(row.get("status", "")).lower() not in {"unknown", "not found"}
+    ]
     if not rows:
         return []
     architecture = framework.get("architecture_question", {})
@@ -569,7 +536,11 @@ def render_competitive_landscape(memo: dict) -> list[str]:
 
 def render_traction_analysis(memo: dict) -> list[str]:
     analysis = memo.get("traction_analysis", {})
-    rows = analysis.get("rows", [])
+    rows = [
+        row
+        for row in analysis.get("rows", [])
+        if row.get("source_ids") and str(row.get("status", "")).lower() != "unknown"
+    ]
     if not rows:
         return []
     lines = ["## Traction Analysis", "", analysis.get("summary", ""), ""]
@@ -629,7 +600,7 @@ def render_business_model_analysis(memo: dict) -> list[str]:
 
 def render_risk_taxonomy(memo: dict) -> list[str]:
     taxonomy = memo.get("risk_taxonomy", {})
-    rows = taxonomy.get("rows", [])
+    rows = [row for row in taxonomy.get("rows", []) if row.get("source_ids")]
     if not rows:
         return []
     lines = [
@@ -703,11 +674,8 @@ def render_memo_markdown(state: DealMemoState) -> str:
     lines.extend(render_investment_scorecard_graph(memo))
     lines.extend(render_thesis_framework(memo))
     lines.extend(render_defensibility_framework(memo))
-    lines.extend(render_competitive_landscape(memo))
     lines.extend(render_traction_analysis(memo))
-    lines.extend(render_business_model_analysis(memo))
     lines.extend(render_risk_taxonomy(memo))
-    lines.extend(render_claim_verification_layer(memo))
     lines.extend(render_missing_data(memo))
 
     recommendation = memo.get("recommendation", {})
@@ -743,9 +711,6 @@ def render_memo_markdown(state: DealMemoState) -> str:
             lines.append(f"- {claim['text']} {citation_label(claim)}")
         lines.append("")
 
-    lines.extend(render_bull_bear_chart(memo))
-    lines.extend(render_claim_verification_graph(memo))
-
     verification = memo.get("partner_note_verification", [])
     if verification:
         lines.extend(["## Partner Claim Verification Table", ""])
@@ -766,8 +731,6 @@ def render_memo_markdown(state: DealMemoState) -> str:
                 + " |"
             )
         lines.append("")
-
-    lines.extend(render_risk_breakdown_graph(memo))
 
     if memo.get("what_needs_to_be_true"):
         lines.extend(["## What Needs To Be True", ""])
@@ -823,64 +786,41 @@ def render_memo_markdown(state: DealMemoState) -> str:
                 lines.append(f"- {item} [Inference]")
         lines.append("")
 
-    confidence = memo.get("section_confidence", {})
-    if confidence:
-        lines.extend(["## Section Confidence", ""])
-        lines.append("| Section | Confidence | Interpretation |")
-        lines.append("| --- | --- | --- |")
-        for section, value in confidence.items():
-            if value == "High":
-                meaning = "Multiple reliable sources agree."
-            elif value == "Medium":
-                meaning = "Some support exists but key facts are missing."
-            else:
-                meaning = "Mostly inference, low-quality support, or notes-only."
-            lines.append(f"| {section} | {value} | {meaning} |")
-        lines.append("")
-
-    validator = memo.get("memo_validator", {})
-    if validator:
-        lines.extend(["## Memo Validator", ""])
-        lines.append(f"**Status:** {'Pass' if validator.get('passed') else 'Fail'}")
-        lines.append(f"**Severity:** {validator.get('severity', 'low')}")
-        lines.extend(["", "| Severity | Warning | Suggested Fix |", "| --- | --- | --- |"])
-        for item in validator.get("warnings", []):
-            lines.append(
-                f"| {_escape_table(item.get('severity', ''))} | {_escape_table(item.get('warning', ''))} | {_escape_table(item.get('suggested_fix', ''))} |"
-            )
-        lines.append("")
-
-    lines.extend(render_company_understanding(memo))
     lines.extend(render_evidence_dashboard(memo))
     lines.extend(render_confidence_calibration(memo))
     lines.extend(render_evidence_coverage(memo))
+    lines.extend(render_claim_verification_layer(memo))
 
     for section in memo.get("sections", []):
         lines.extend([f"## {section['title']}", ""])
-        for claim in section.get("claims", []):
-            lines.append(f"- {claim['text']} {citation_label(claim)}")
-        lines.append("")
-
         if section["title"] == "Competitive Landscape" and state["chart_data"].get("competitive_table"):
-            lines.append("| Company | Buyer | Workflow | Threat Level | Competitor Score | Why It Competes | Sources |")
-            lines.append("| --- | --- | --- | --- | ---: | --- | --- |")
+            lines.append("| Company | Similarity | Buyer | Workflow | Replacement Target | Differentiation Factors | Funding / Scale | Revenue Evidence | Score | Sources |")
+            lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | ---: | --- |")
             for row in state["chart_data"]["competitive_table"]:
                 lines.append(
                     "| "
                     + " | ".join(
                         [
                             _escape_table(row.get("company", "")),
+                            _escape_table(row.get("similarity_tier", "")),
                             _escape_table(row.get("buyer", "")),
                             _escape_table(row.get("workflow", "")),
-                            _escape_table(row.get("threat_level", "")),
+                            _escape_table(row.get("replacement_target", "")),
+                            _escape_table(row.get("differentiation_factors", "")),
+                            _escape_table(row.get("funding_info", "")),
+                            _escape_table(row.get("revenue_available", "")),
                             _escape_table(row.get("competitor_score", "")),
-                            _escape_table(row.get("why_it_competes", "")),
                             _escape_table(row.get("source_ids", "")),
                         ]
                     )
                     + " |"
                 )
             lines.append("")
+            continue
+
+        for claim in section.get("claims", []):
+            lines.append(f"- {claim['text']} {citation_label(claim)}")
+        lines.append("")
 
     lines.extend([f"## Sources Used ({len(state['evidence'])})", ""])
     if state["evidence"]:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from difflib import SequenceMatcher
 import re
 from typing import Any
 
@@ -67,6 +68,266 @@ def _extract_founder(raw_notes: str) -> str:
             if name.lower().split()[0] not in {"and", "or", "the", "team", "founder", "customers"}:
                 return name
     return ""
+
+
+LEADERSHIP_TERMS = [
+    "founder",
+    "co-founder",
+    "cofounder",
+    "ceo",
+    "chief executive",
+    "cto",
+    "chief technology officer",
+    "cpo",
+    "chief product officer",
+    "president",
+    "leadership",
+    "founded by",
+    "led by",
+]
+
+
+NON_PERSON_NAME_TOKENS = {
+    "ai",
+    "and",
+    "api",
+    "app",
+    "apps",
+    "blog",
+    "careers",
+    "company",
+    "crunchbase",
+    "customer",
+    "customers",
+    "data",
+    "design",
+    "docs",
+    "enterprise",
+    "founder",
+    "founders",
+    "fortune",
+    "google",
+    "health",
+    "home",
+    "inc",
+    "labs",
+    "legal",
+    "leadership",
+    "linkedin",
+    "market",
+    "medical",
+    "microsoft",
+    "news",
+    "official",
+    "or",
+    "platform",
+    "product",
+    "profile",
+    "research",
+    "software",
+    "team",
+    "technology",
+    "technologies",
+    "the",
+    "tools",
+    "website",
+}
+
+
+def _valid_person_name(name: str, company: str = "") -> bool:
+    cleaned = re.sub(r"\s+", " ", name).strip(" ,.-")
+    if not cleaned or len(cleaned.split()) < 2 or len(cleaned.split()) > 3:
+        return False
+    lower = cleaned.lower()
+    if company and lower in {company.lower(), company.lower().replace(".", " ")}:
+        return False
+    words = re.split(r"\s+", lower)
+    if any(word in NON_PERSON_NAME_TOKENS for word in words):
+        return False
+    if any(char.isdigit() for char in cleaned):
+        return False
+    return all(re.match(r"^[A-Z][A-Za-z'.-]+$", word) for word in cleaned.split())
+
+
+def _leadership_role_from_context(context: str) -> str:
+    lower = context.lower()
+    roles = []
+    if "co-founder" in lower or "cofounder" in lower:
+        roles.append("Co-founder")
+    elif "founder" in lower or "founded by" in lower:
+        roles.append("Founder")
+    if "ceo" in lower or "chief executive" in lower:
+        roles.append("CEO")
+    if "cto" in lower or "chief technology officer" in lower:
+        roles.append("CTO")
+    if "cpo" in lower or "chief product officer" in lower:
+        roles.append("CPO")
+    if "president" in lower:
+        roles.append("President")
+    return " / ".join(dict.fromkeys(roles)) or "Leadership"
+
+
+def _extract_leadership_people_from_text(text: str, company: str = "") -> list[dict[str, Any]]:
+    if not text or not _contains_any(text, LEADERSHIP_TERMS):
+        return []
+    name_token = r"[A-Z][A-Za-z']+(?:-[A-Z][A-Za-z']+)?"
+    name_pattern = rf"{name_token}(?:\s+{name_token}){{1,2}}"
+    role_pattern = r"(?i:co-founder|cofounder|founder|ceo|chief executive|cto|chief technology officer|cpo|chief product officer|president)"
+    patterns = [
+        rf"({name_pattern})\s*,?\s+(?i:is|was|serves as|joined as|,)?\s*(?i:the\s+)?{role_pattern}\b",
+        rf"({name_pattern})\s+(?i:is|was)\s+(?i:listed\s+as|named\s+as|identified\s+as|shown\s+as)\s+(?i:the\s+)?{role_pattern}\b",
+        rf"{role_pattern}\s+(?i:is|was|=|:)?\s*({name_pattern})",
+        rf"(?i:founder|co-founder|cofounder)\s+(?i:and\s+)?(?i:ceo|chief executive|cto|chief technology officer|president)?\s*({name_pattern})",
+        rf"(?i:founded by|led by)\s+({name_pattern})(?:\s+(?i:and)\s+({name_pattern}))?",
+        rf"(?i:founder|co-founder|cofounder)\s+({name_pattern})\s+(?i:previously|formerly|built|led|started|sold|founded|runs|ran)\b",
+    ]
+    people: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            context = text[max(0, match.start() - 80) : min(len(text), match.end() + 80)]
+            for group in match.groups():
+                if not group:
+                    continue
+                name = re.sub(r"\s+", " ", group).strip(" ,.-")
+                key = name.lower()
+                if key in seen or not _valid_person_name(name, company):
+                    continue
+                seen.add(key)
+                people.append({"name": name, "role": _leadership_role_from_context(context), "context": context.strip()})
+    return people
+
+
+def _can_extract_team_from_source(item: EvidenceItem) -> bool:
+    source_type = item.get("source_type", "")
+    evidence_type = item.get("evidence_type", "")
+    text = f"{item.get('title', '')} {item.get('snippet', '')} {item.get('url', '')}"
+    if evidence_type == "leadership":
+        return source_type not in {"generic_blog", "vendor_blog"}
+    if evidence_type in {"website", "news", "funding"} and _contains_any(text, LEADERSHIP_TERMS):
+        return source_type in {
+            "company_owned",
+            "official_press_release",
+            "independent_news",
+            "funding_database",
+            "professional_profile",
+            "customer_case_study",
+        } or item.get("source_tier", 3) <= 2
+    return False
+
+
+def _team_source_label(item: EvidenceItem) -> str:
+    source_type = str(item.get("source_type", "public_source")).replace("_", " ")
+    return f"{item.get('source_id', 'Source')} ({source_type}; Tier {item.get('source_tier', 3)})"
+
+
+def _team_verification_status(person: dict[str, Any]) -> str:
+    source_ids = person.get("source_ids", [])
+    note_reference = bool(person.get("note_reference"))
+    if note_reference and source_ids:
+        return "Verified by partner notes and public evidence"
+    if len(source_ids) >= 2:
+        return "Verified by multiple public sources"
+    if len(source_ids) == 1:
+        return "Single public source - requires corroboration"
+    if note_reference:
+        return "Partner notes only - requires public verification"
+    return "Unknown"
+
+
+def _team_confidence(person: dict[str, Any]) -> str:
+    status = _team_verification_status(person)
+    source_tiers = person.get("source_tiers", [])
+    if status in {"Verified by partner notes and public evidence", "Verified by multiple public sources"}:
+        return "High" if any(tier <= 2 for tier in source_tiers) or person.get("note_reference") else "Medium"
+    if status == "Single public source - requires corroboration":
+        return "Medium" if source_tiers and min(source_tiers) <= 1 else "Low"
+    if status == "Partner notes only - requires public verification":
+        return "Medium"
+    return "Low"
+
+
+def _founding_team_profile(profile: dict[str, Any], evidence: list[EvidenceItem]) -> dict[str, Any]:
+    company = profile.get("company", profile.get("raw_company_name", ""))
+    people_by_name: dict[str, dict[str, Any]] = {}
+
+    for person in _extract_leadership_people_from_text(profile.get("raw_notes", ""), company):
+        people_by_name[person["name"].lower()] = {
+            "name": person["name"],
+            "role": person["role"],
+            "source": "Partner Notes",
+            "source_ids": [],
+            "source_labels": ["Partner Notes"],
+            "source_tiers": [],
+            "note_reference": True,
+            "confidence": "Medium",
+            "verification_status": "Partner notes only - requires public verification",
+            "evidence": person["context"],
+        }
+
+    for item in evidence:
+        if not _can_extract_team_from_source(item):
+            continue
+        text = f"{item.get('title', '')}. {item.get('snippet', '')}"
+        for person in _extract_leadership_people_from_text(text, company):
+            key = person["name"].lower()
+            existing = people_by_name.get(key)
+            if existing:
+                existing.setdefault("source_ids", [])
+                existing.setdefault("source_labels", [])
+                existing.setdefault("source_tiers", [])
+                if item["source_id"] not in existing["source_ids"]:
+                    existing["source_ids"].append(item["source_id"])
+                    existing["source_labels"].append(_team_source_label(item))
+                    existing["source_tiers"].append(item.get("source_tier", 3))
+                if existing.get("source") == "Partner Notes":
+                    existing["source"] = "Partner Notes + Public Evidence"
+            else:
+                people_by_name[key] = {
+                    "name": person["name"],
+                    "role": person["role"],
+                    "source": "Public Evidence",
+                    "source_ids": [item["source_id"]],
+                    "source_labels": [_team_source_label(item)],
+                    "source_tiers": [item.get("source_tier", 3)],
+                    "note_reference": False,
+                    "evidence": person["context"],
+                }
+
+    people = list(people_by_name.values())
+    for person in people:
+        person["verification_status"] = _team_verification_status(person)
+        person["confidence"] = _team_confidence(person)
+    if not people:
+        return {
+            "status": "Unknown",
+            "summary": "Founding team: Unknown from current partner notes and public leadership evidence.",
+            "people": [],
+            "confidence": "Low",
+            "source_ids": [],
+        }
+
+    source_ids = []
+    for person in people:
+        source_ids.extend(person.get("source_ids", []))
+    verified_people = [
+        person
+        for person in people
+        if person.get("verification_status") in {"Verified by partner notes and public evidence", "Verified by multiple public sources"}
+    ]
+    preliminary_people = [person for person in people if person not in verified_people]
+    names = ", ".join(
+        f"{person['name']} ({person['role']}; {person['verification_status']})" for person in (verified_people + preliminary_people)[:4]
+    )
+    return {
+        "status": "Found",
+        "summary": f"Founding/team names identified: {names}. Names not corroborated by multiple sources should be treated as preliminary.",
+        "people": people,
+        "confidence": "High" if verified_people else "Medium" if preliminary_people else "Low",
+        "verified_count": len(verified_people),
+        "preliminary_count": len(preliminary_people),
+        "source_ids": sorted(dict.fromkeys(source_ids)),
+    }
 
 
 def _identity_attributes(raw_notes: str, product: str, sector: str, customers: list[str]) -> dict[str, Any]:
@@ -186,6 +447,66 @@ PRODUCT_DESIGN_TERMS = [
     "whiteboarding",
 ]
 
+VOICE_AUDIO_AI_TERMS = [
+    "text to speech",
+    "text-to-speech",
+    "speech to text",
+    "speech-to-text",
+    "voice ai",
+    "ai voice",
+    "voice generation",
+    "voice cloning",
+    "voice synthesis",
+    "speech synthesis",
+    "generative voice",
+    "generative audio",
+    "audio ai",
+    "dubbing",
+    "voiceover",
+    "voice over",
+    "speech model",
+    "speech models",
+    "conversational voice",
+    "synthetic voice",
+]
+
+DATA_AI_PLATFORM_TERMS = [
+    "data and ai platform",
+    "data ai platform",
+    "data intelligence platform",
+    "data platform",
+    "ai data platform",
+    "lakehouse",
+    "data lakehouse",
+    "data warehouse",
+    "data engineering",
+    "machine learning platform",
+    "ml platform",
+    "analytics platform",
+    "data analytics platform",
+    "ai workloads",
+    "data science platform",
+    "data governance",
+    "mlops",
+]
+
+WORKSPACE_PRODUCTIVITY_TERMS = [
+    "workspace",
+    "productivity",
+    "connected workspace",
+    "knowledge management",
+    "knowledge base",
+    "wiki",
+    "docs",
+    "documents",
+    "project management",
+    "project tracking",
+    "collaboration platform",
+    "team collaboration",
+    "internal knowledge",
+    "work management",
+]
+
 
 def _customer_context_contains(raw_notes: str, terms: list[str]) -> bool:
     customer_context = re.compile(
@@ -199,8 +520,69 @@ def _customer_context_contains(raw_notes: str, terms: list[str]) -> bool:
     return False
 
 
+def _clean_inferred_phrase(value: str) -> str:
+    cleaned = re.sub(r"\s+", " ", value).strip(" .,:;-")
+    cleaned = re.sub(r"(?i)\b(learn more|sign up|contact sales|get started)\b.*$", "", cleaned).strip(" .,:;-")
+    return cleaned[:160].strip()
+
+
+def _infer_generic_product_from_text(text: str) -> str:
+    snippets = re.split(r"(?<=[.!?])\s+|\n+", text)
+    patterns = [
+        r"(?i)\b(?:is|provides|offers|builds|develops|delivers)\s+(?:an?\s+|the\s+)?([^.;\n]{8,140}?\b(?:platform|software|suite|api|infrastructure|marketplace|tool|solution|system)\b[^.;\n]{0,80})",
+        r"(?i)\b((?:[a-z0-9-]+\s+){0,8}(?:platform|software|suite|api|infrastructure|marketplace|tool|solution|system)\s+for\s+[^.;\n]{5,100})",
+    ]
+    for snippet in snippets:
+        for pattern in patterns:
+            match = re.search(pattern, snippet)
+            if match:
+                phrase = _clean_inferred_phrase(match.group(1))
+                if len(phrase.split()) >= 3 and not _contains_any(phrase, ["cookie", "privacy policy", "terms of service"]):
+                    return phrase
+    return "Not specified"
+
+
+def _infer_buyer_from_product(product: str) -> str:
+    lower = product.lower()
+    buyer_patterns = [
+        (r"\bfor\s+([^.;,\n]{3,80})", 1),
+        (r"\bused by\s+([^.;,\n]{3,80})", 1),
+        (r"\bserving\s+([^.;,\n]{3,80})", 1),
+    ]
+    for pattern, group in buyer_patterns:
+        match = re.search(pattern, lower)
+        if match:
+            buyer = _clean_inferred_phrase(match.group(group))
+            if buyer and not _is_placeholder_entity(buyer):
+                return buyer
+    if "developer" in lower or "api" in lower:
+        return "developers and product teams"
+    if "enterprise" in lower:
+        return "enterprise buyers"
+    if "creator" in lower or "media" in lower:
+        return "creators, media teams, and marketing teams"
+    return "business teams and enterprise buyers"
+
+
+def _infer_workflow_from_product(product: str) -> str:
+    lower = product.lower()
+    match = re.search(r"\bfor\s+([^.;\n]{5,100})", lower)
+    if match:
+        return _clean_inferred_phrase(match.group(1))
+    for suffix in ["platform", "software", "suite", "api", "infrastructure", "marketplace", "tool", "solution", "system"]:
+        if suffix in lower:
+            return _clean_inferred_phrase(lower.replace("platform", "workflows").replace("software", "workflows"))
+    return product
+
+
 def _infer_product_from_text(text: str) -> str:
     lower = text.lower()
+    if _contains_any(lower, DATA_AI_PLATFORM_TERMS):
+        return "data and AI platform for analytics, data engineering, machine learning, and AI workloads"
+    if _contains_any(lower, VOICE_AUDIO_AI_TERMS):
+        return "voice AI platform for text-to-speech, voice generation, dubbing, and speech workflows"
+    if _contains_any(lower, WORKSPACE_PRODUCTIVITY_TERMS):
+        return "connected workspace for docs, wiki, project management, knowledge management, and team collaboration"
     if _contains_any(lower, PRODUCT_DESIGN_TERMS):
         return "collaborative product design, prototyping, design systems, and product collaboration platform"
     if _contains_any(lower, ["cybersecurity", "security operations", "security software", "compliance software", "grc"]):
@@ -231,7 +613,7 @@ def _infer_product_from_text(text: str) -> str:
         return "prior authorization and utilization management automation"
     if _contains_any(lower, ["revenue cycle", "rcm"]):
         return "revenue cycle automation"
-    return "Not specified"
+    return _infer_generic_product_from_text(text)
 
 
 BROAD_PRODUCT_TERMS = [
@@ -295,6 +677,14 @@ def _extract_use_cases_from_text(text: str) -> list[str]:
         ("compliance workflows", ["compliance software", "compliance workflow"]),
         ("cybersecurity workflows", ["cybersecurity", "security operations"]),
         ("collaborative product design", PRODUCT_DESIGN_TERMS),
+        ("voice generation", ["voice generation", "voice cloning", "voice synthesis", "synthetic voice"]),
+        ("text-to-speech", ["text to speech", "text-to-speech", "speech synthesis"]),
+        ("dubbing and localization", ["dubbing", "localization", "voiceover", "voice over"]),
+        ("data engineering", ["data engineering", "data pipelines", "elt", "etl"]),
+        ("analytics and BI", ["analytics", "business intelligence", "bi", "dashboards"]),
+        ("machine learning and AI workloads", ["machine learning", "ml platform", "ai workloads", "mlops"]),
+        ("data governance", ["data governance", "catalog", "lineage"]),
+        ("lakehouse / warehouse", ["lakehouse", "data warehouse", "data lake"]),
         ("workflow automation", ["workflow automation"]),
     ]
     use_cases = []
@@ -322,6 +712,12 @@ def _product_evidence_conflicts(note_product: str, evidence_product: str, note_s
 
 def _infer_sector_from_text(text: str) -> str:
     lower = text.lower()
+    if _contains_any(lower, DATA_AI_PLATFORM_TERMS):
+        return "Data / AI Infrastructure"
+    if _contains_any(lower, VOICE_AUDIO_AI_TERMS):
+        return "Voice / Audio AI"
+    if _contains_any(lower, WORKSPACE_PRODUCTIVITY_TERMS):
+        return "Workspace / Productivity Software"
     if _contains_any(lower, PRODUCT_DESIGN_TERMS):
         return "Product Design Software"
     if _contains_any(lower, ["cybersecurity", "security operations", "security software", "grc", "compliance software"]):
@@ -344,10 +740,18 @@ def _infer_sector_from_text(text: str) -> str:
         return "Biotech"
     if _contains_any(lower, ["healthcare", "hospital", "health system", "health systems", "clinical", "physician", "doctor", "patient", "ehr", "epic", "cmio", "hipaa", "phi", "prior authorization", "radiology", "radiologist", "imaging"]):
         return "Healthcare AI"
+    if _infer_generic_product_from_text(text) != "Not specified":
+        return "Other / Emerging Software"
     return "Unknown"
 
 
 def _infer_market_keywords(product: str, sector: str) -> list[str]:
+    if sector == "Data / AI Infrastructure" or "data and AI platform" in product:
+        return ["data and AI platform", "data lakehouse analytics platform", "machine learning data platform"]
+    if sector == "Voice / Audio AI" or "voice AI platform" in product:
+        return ["voice AI platform", "text to speech software", "generative audio dubbing speech AI"]
+    if sector == "Workspace / Productivity Software" or "connected workspace" in product:
+        return ["workspace productivity software", "knowledge management collaboration platform", "docs wiki project management software"]
     if sector == "Product Design Software" or "collaborative product design" in product:
         return ["collaborative design software", "product design platform", "design systems prototyping software"]
     if "radiology report generation" in product:
@@ -376,10 +780,18 @@ def _infer_market_keywords(product: str, sector: str) -> list[str]:
         return ["healthcare revenue cycle automation", "RCM AI automation"]
     if sector == "Healthcare AI":
         return ["healthcare AI workflow automation"]
+    if sector == "Other / Emerging Software" and not _is_placeholder_entity(product):
+        return [product, f"{_infer_workflow_from_product(product)} software", f"{_infer_buyer_from_product(product)} software"]
     return [sector.lower()]
 
 
 def _infer_business_model(product: str, sector: str) -> str:
+    if sector == "Data / AI Infrastructure":
+        return "Consumption, subscription, and enterprise platform revenue tied to data workloads, compute usage, governance, and AI/ML adoption"
+    if sector == "Voice / Audio AI":
+        return "Usage-based, seat-based, API, or enterprise SaaS revenue tied to generated audio, voice workflows, and creator/developer usage"
+    if sector == "Workspace / Productivity Software":
+        return "Seat-based SaaS with team and enterprise plans sold to individuals, teams, startups, and enterprise knowledge-work organizations"
     if sector == "Product Design Software":
         return "Seat-based or enterprise SaaS sold to design, product, engineering, and enterprise software teams"
     if sector == "LegalTech":
@@ -400,10 +812,18 @@ def _infer_business_model(product: str, sector: str) -> str:
         return "Government contracting, defense programs, hardware/software systems, and mission software revenue"
     if sector == "Healthcare AI":
         return "Enterprise healthcare software or workflow automation sold to health systems, providers, payers, or life sciences buyers"
+    if sector == "Other / Emerging Software":
+        return "Business model requires diligence; likely SaaS, usage-based, transaction, marketplace, or services-enabled revenue depending on product motion"
     return "Unknown"
 
 
 def _subindustry_for(product: str, sector: str) -> str:
+    if sector == "Data / AI Infrastructure":
+        return "Lakehouse / Data and AI Platform"
+    if sector == "Voice / Audio AI":
+        return "Generative Voice / Speech AI"
+    if sector == "Workspace / Productivity Software":
+        return "Connected Workspace / Knowledge Management"
     if sector == "Product Design Software":
         return "Collaborative Design / Product Development"
     if "radiology report generation" in product:
@@ -432,10 +852,18 @@ def _subindustry_for(product: str, sector: str) -> str:
         return "Revenue Cycle Automation"
     if sector == "Healthcare AI":
         return "Healthcare Workflow Automation"
+    if sector == "Other / Emerging Software":
+        return "Provisional category from public product evidence"
     return "Unknown"
 
 
 def _critical_dependencies(product: str, sector: str) -> list[str]:
+    if sector == "Data / AI Infrastructure":
+        return ["Cloud platform partnerships", "Open-source ecosystem", "Data governance and security", "Performance and workload reliability", "Enterprise migration and integration"]
+    if sector == "Voice / Audio AI":
+        return ["Voice model quality", "Latency and reliability", "Rights and consent workflows", "API/developer adoption", "Enterprise security and content controls"]
+    if sector == "Workspace / Productivity Software":
+        return ["Enterprise identity/security", "Workspace migration", "Admin and governance controls", "AI knowledge retrieval quality", "Integrations with productivity suites"]
     if sector == "Product Design Software":
         return ["Design-system adoption", "Enterprise identity/security", "Developer handoff workflows", "Collaboration performance", "AI-assisted design roadmap"]
     if "radiology report generation" in product:
@@ -462,10 +890,18 @@ def _critical_dependencies(product: str, sector: str) -> list[str]:
         return ["Payer/provider integrations", "Clinical policy rules", "Utilization management workflows", "Regulatory compliance"]
     if sector == "Healthcare AI":
         return ["Healthcare workflow integrations", "Security/compliance", "Customer change management"]
+    if sector == "Other / Emerging Software":
+        return ["Clear buyer definition", "Workflow integration", "Security and trust", "Repeatable implementation", "Distribution channel"]
     return ["Customer integrations", "Distribution channels", "Implementation capacity"]
 
 
 def _revenue_drivers(product: str, sector: str) -> list[str]:
+    if sector == "Data / AI Infrastructure":
+        return ["Data/AI workload growth", "Compute consumption", "Enterprise expansion", "Governance/security modules", "Retention and workload consolidation"]
+    if sector == "Voice / Audio AI":
+        return ["Generated audio volume", "API usage", "Creator subscriptions", "Enterprise contracts", "Localization/dubbing workflows", "Retention and expansion"]
+    if sector == "Workspace / Productivity Software":
+        return ["Seat expansion", "Team-to-enterprise conversion", "Workspace depth", "AI add-on adoption", "Retention and expansion across departments"]
     if sector == "Product Design Software":
         return ["Designer seats", "Product/engineering expansion", "Enterprise plan adoption", "Design-system workflow depth", "Retention and seat expansion"]
     if "radiology report generation" in product:
@@ -492,10 +928,18 @@ def _revenue_drivers(product: str, sector: str) -> list[str]:
         return ["Authorization volume", "Payer/provider contracts", "Automation rate", "Clinical review savings"]
     if sector == "Healthcare AI":
         return ["Enterprise contracts", "Usage volume", "Workflow expansion", "Renewals"]
+    if sector == "Other / Emerging Software":
+        return ["Paid customer count", "Usage volume", "Expansion", "Retention", "Pricing model validation"]
     return ["ARR", "Expansion revenue", "Retention"]
 
 
 def _budget_owner_for(product: str, sector: str) -> str:
+    if sector == "Data / AI Infrastructure":
+        return "CIO / CDO / CTO / Data and AI leadership"
+    if sector == "Voice / Audio AI":
+        return "Product / Engineering / Creative Operations / Marketing"
+    if sector == "Workspace / Productivity Software":
+        return "Department leaders / IT / CIO / Operations"
     if sector == "Product Design Software":
         return "Design leadership / Product leadership / CIO or IT for enterprise plans"
     if "radiology report generation" in product:
@@ -524,11 +968,72 @@ def _budget_owner_for(product: str, sector: str) -> str:
         return "CFO / Revenue Cycle Leader"
     if sector == "Healthcare AI":
         return "CIO / Operations Leader"
+    if sector == "Other / Emerging Software":
+        return "Economic buyer requires diligence"
     return "Unknown"
 
 
 def _competitor_framework(product: str, customers: list[str] | str) -> dict[str, Any]:
     customer_text = ", ".join(customers) if isinstance(customers, list) else str(customers)
+    if "data and ai platform" in product.lower():
+        return {
+            "primary_workflow": "data engineering, analytics, governance, machine learning, and AI workload development",
+            "primary_buyer": customer_text if customer_text != "not specified" else "CIOs, CDOs, CTOs, data teams, AI/ML teams, and enterprise platform owners",
+            "product_category": "data and AI infrastructure platform",
+            "known_competitors": ["Snowflake", "Google BigQuery", "Amazon Redshift", "Microsoft Fabric", "Palantir", "Cloudera", "dbt", "Apache Spark"],
+            "competitor_groups": {
+                "Direct Competitors": ["Snowflake"],
+                "Adjacent Competitors": ["Google BigQuery", "Amazon Redshift", "Microsoft Fabric", "Palantir", "dbt"],
+                "Incumbents": ["Cloudera", "Enterprise data warehouses", "Internal data platforms"],
+                "Open-source / Low-cost Alternatives": ["Apache Spark", "Open-source lakehouse stack"],
+            },
+            "exclusions": ["generic AI apps without data platform/workload overlap"],
+        }
+    if "voice AI platform" in product:
+        return {
+            "primary_workflow": "text-to-speech, voice generation, dubbing, localization, and speech API workflows",
+            "primary_buyer": customer_text if customer_text != "not specified" else "developers, creators, media teams, product teams, and enterprises",
+            "product_category": "voice and generative audio AI",
+            "known_competitors": ["PlayHT", "Murf AI", "Resemble AI", "WellSaid Labs", "Descript", "OpenAI audio models", "Google Cloud Text-to-Speech", "Amazon Polly"],
+            "competitor_groups": {
+                "Direct Competitors": ["PlayHT", "Murf AI", "Resemble AI", "WellSaid Labs"],
+                "Adjacent Competitors": ["Descript", "OpenAI audio models"],
+                "Incumbents": ["Google Cloud Text-to-Speech", "Amazon Polly", "Microsoft Azure AI Speech"],
+            },
+            "exclusions": ["generic enterprise AI tools without audio workflow overlap"],
+        }
+    if "connected workspace" in product:
+        return {
+            "primary_workflow": "documentation, team collaboration, project tracking, internal knowledge management, and workspace consolidation",
+            "primary_buyer": customer_text if customer_text != "not specified" else "individuals, teams, startups, enterprises, knowledge workers, and product/design/engineering/ops teams",
+            "product_category": "workspace productivity and collaboration software",
+            "known_competitors": [
+                "Microsoft 365",
+                "Google Workspace",
+                "Coda",
+                "Confluence",
+                "Dropbox Paper",
+                "Asana",
+                "ClickUp",
+                "Monday.com",
+                "Linear",
+                "Airtable",
+                "Smartsheet",
+                "Microsoft Copilot",
+                "Google Gemini",
+                "Atlassian Intelligence",
+                "docs + spreadsheets + Slack/email",
+            ],
+            "competitor_groups": {
+                "Productivity Suites": ["Microsoft 365", "Google Workspace"],
+                "Docs / Wiki / Collaboration": ["Coda", "Confluence", "Dropbox Paper"],
+                "Project Management": ["Asana", "ClickUp", "Monday.com", "Linear"],
+                "Database / Workflow Tools": ["Airtable", "Smartsheet"],
+                "Horizontal AI / Workspace Platforms": ["Microsoft Copilot", "Google Gemini", "Atlassian Intelligence"],
+                "Internal / Manual Workflow": ["docs + spreadsheets + Slack/email"],
+            },
+            "exclusions": ["cybersecurity vendors", "compliance-only tools", "healthcare workflow vendors", "ERP implementation content"],
+        }
     if "collaborative product design" in product:
         return {
             "primary_workflow": "collaborative interface design, prototyping, design systems, developer handoff, and product collaboration",
@@ -711,6 +1216,21 @@ def _competitor_framework(product: str, customers: list[str] | str) -> dict[str,
             },
             "exclusions": ["ambient clinical documentation vendors"],
         }
+    if not _is_placeholder_entity(product) and product != "Not specified":
+        buyer = customer_text if customer_text != "not specified" else _infer_buyer_from_product(product)
+        workflow = _infer_workflow_from_product(product)
+        return {
+            "primary_workflow": workflow,
+            "primary_buyer": buyer,
+            "product_category": f"provisional category: {product}",
+            "known_competitors": ["Incumbent workflow tools", "Internal build", "Manual process", "Adjacent platforms"],
+            "competitor_groups": {
+                "Internal / Manual Workflow": ["Internal build", "Manual process"],
+                "Adjacent Competitors": ["Adjacent platforms"],
+                "Incumbents": ["Incumbent workflow tools"],
+            },
+            "exclusions": ["unrelated keyword matches without buyer/workflow overlap"],
+        }
     return {
         "primary_workflow": "Unknown" if _is_placeholder_entity(product) else product,
         "primary_buyer": customer_text if customer_text != "not specified" else "Unknown",
@@ -722,6 +1242,21 @@ def _competitor_framework(product: str, customers: list[str] | str) -> dict[str,
 
 
 KNOWN_COMPETITOR_NAMES = [
+    "Microsoft",
+    "Microsoft 365",
+    "Google Workspace",
+    "Coda",
+    "Confluence",
+    "Dropbox Paper",
+    "Asana",
+    "ClickUp",
+    "Monday.com",
+    "Linear",
+    "Airtable",
+    "Smartsheet",
+    "Microsoft Copilot",
+    "Google Gemini",
+    "Atlassian Intelligence",
     "Adobe",
     "Canva",
     "Miro",
@@ -748,6 +1283,22 @@ KNOWN_COMPETITOR_NAMES = [
     "DeepScribe",
     "Augmedix",
     "Ambience",
+    "PlayHT",
+    "Murf AI",
+    "Resemble AI",
+    "WellSaid Labs",
+    "Descript",
+    "Amazon Polly",
+    "Google Cloud Text-to-Speech",
+    "Microsoft Azure AI Speech",
+    "Snowflake",
+    "Google BigQuery",
+    "Amazon Redshift",
+    "Microsoft Fabric",
+    "Apache Spark",
+    "dbt",
+    "Cloudera",
+    "Palantir",
 ]
 
 
@@ -785,10 +1336,43 @@ def _normalized_company_name(name: str) -> str:
     return " ".join(meaningful or tokens)
 
 
+def _compact_company_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(name or "").lower())
+
+
+def _company_name_match_score(left: str, right: str) -> float:
+    left_norm = _normalized_company_name(left)
+    right_norm = _normalized_company_name(right)
+    left_compact = _compact_company_name(left)
+    right_compact = _compact_company_name(right)
+    if not left_compact or not right_compact:
+        return 0.0
+    if left_norm and right_norm and (left_norm in right_norm or right_norm in left_norm):
+        return 1.0
+    if left_compact in right_compact or right_compact in left_compact:
+        return 1.0
+    return max(SequenceMatcher(None, left_norm, right_norm).ratio(), SequenceMatcher(None, left_compact, right_compact).ratio())
+
+
+def _text_mentions_company_fuzzy(company: str, text: str, threshold: float = 0.86) -> bool:
+    company_compact = _compact_company_name(company)
+    if not company_compact:
+        return False
+    text_lower = str(text or "").lower()
+    if company.lower() in text_lower or company_compact in _compact_company_name(text_lower):
+        return True
+    tokens = [token for token in re.split(r"[^a-z0-9]+", text_lower) if len(token) > 2]
+    company_token_count = max(1, len([token for token in re.split(r"[^a-z0-9]+", company.lower()) if token]))
+    for window_size in {1, company_token_count, company_token_count + 1}:
+        for idx in range(0, max(0, len(tokens) - window_size + 1)):
+            candidate = "".join(tokens[idx : idx + window_size])
+            if SequenceMatcher(None, company_compact, candidate).ratio() >= threshold:
+                return True
+    return False
+
+
 def _is_target_company_alias(candidate: str, target_company: str) -> bool:
-    candidate_key = _normalized_company_name(candidate)
-    target_key = _normalized_company_name(target_company)
-    return bool(candidate_key and target_key and candidate_key == target_key)
+    return _company_name_match_score(candidate, target_company) >= 0.92
 
 
 def _filter_target_company_aliases(candidates: list[str], target_company: str) -> list[str]:
@@ -827,6 +1411,7 @@ def _competitors_mentioned(raw_notes: str, target_company: str = "") -> list[str
 
 
 POSITIONING_SIGNAL_TERMS = {
+    "Workspace / Productivity Software": WORKSPACE_PRODUCTIVITY_TERMS,
     "Product Design Software": PRODUCT_DESIGN_TERMS,
     "Cybersecurity": ["cybersecurity", "cyber security", "security software", "security platform", "threat", "soc", "vulnerability"],
     "Workflow automation": ["workflow automation", "automation platform", "process automation"],
@@ -929,6 +1514,16 @@ def _specificity_score(value: str, generic_terms: list[str]) -> float:
             "spend management",
             "corporate cards",
             "defense",
+            "voice",
+            "speech",
+            "dubbing",
+            "audio",
+            "data",
+            "analytics",
+            "lakehouse",
+            "warehouse",
+            "machine learning",
+            "mlops",
         ]
     ):
         return 0.2
@@ -1116,6 +1711,20 @@ def _company_understanding(profile: dict[str, Any]) -> dict[str, Any]:
 def _diligence_topics_for_profile(profile: dict[str, Any]) -> list[str]:
     sector = profile.get("sector", "Unknown")
     target_company = profile.get("raw_company_name") or profile.get("company", "")
+    if sector == "Data / AI Infrastructure":
+        data_competitors = _filter_target_company_aliases(
+            ["Snowflake", "Google BigQuery", "Amazon Redshift", "Microsoft Fabric", "Palantir", "dbt", "Apache Spark"],
+            target_company,
+        )
+        return [
+            "enterprise expansion and workload consolidation",
+            "AI workload growth and consumption durability",
+            "gross margin after cloud infrastructure and compute costs",
+            "open-source strategy and ecosystem conversion",
+            "data governance, security, and platform lock-in",
+            f"win/loss versus {', '.join(data_competitors[:5])}" if data_competitors else "win/loss versus data and AI platform alternatives",
+            "net revenue retention and expansion economics",
+        ]
     if sector == "Product Design Software":
         product_design_competitors = _filter_target_company_aliases(
             ["Adobe", "Canva", "Miro", "Sketch", "Framer", "Atlassian"],
@@ -1129,6 +1738,20 @@ def _diligence_topics_for_profile(profile: dict[str, Any]) -> list[str]:
             "developer handoff and design-system depth",
             f"competitive pressure from {', '.join(product_design_competitors)}" if product_design_competitors else "competitive pressure from design and product collaboration alternatives",
             "security, governance, and admin controls for enterprise adoption",
+        ]
+    if sector == "Workspace / Productivity Software":
+        workspace_competitors = _filter_target_company_aliases(
+            ["Microsoft 365", "Google Workspace", "Coda", "Confluence", "Asana", "ClickUp", "Monday.com", "Airtable", "Smartsheet"],
+            target_company,
+        )
+        return [
+            "enterprise penetration and department-level expansion",
+            "Microsoft competition and bundling pressure",
+            "retention, engagement, and workspace depth",
+            "AI roadmap for knowledge work and workspace automation",
+            "seat expansion from individuals/teams into enterprise-wide deployments",
+            f"win/loss versus {', '.join(workspace_competitors[:6])}" if workspace_competitors else "win/loss versus workspace and productivity alternatives",
+            "security, governance, permissions, and admin controls for enterprise adoption",
         ]
     if sector == "LegalTech":
         legal_competitors = _filter_target_company_aliases(
@@ -1238,15 +1861,21 @@ def extract_company_profile(state: DealMemoState) -> dict[str, Any]:
         customers.append("CMIO / CIO / clinical operations")
     if _contains_any(raw, ["radiologist", "radiologists", "radiology group", "imaging center", "imaging centers"]):
         customers.append("radiologists and imaging teams")
-    if _contains_any(raw, ["cfo", "finance team", "finance teams", "controller", "accounting", "procurement"]):
+    if _contains_any(raw, ["cfo", "finance team", "finance teams", "controller", "accounting"]) or (
+        sector != "Defense Technology" and _contains_any(raw, ["finance procurement"])
+    ):
         customers.append("CFOs and finance teams")
-    if _customer_context_contains(raw, ["fortune 500", "large enterprise", "large enterprises", "enterprise customer", "enterprise customers"]):
+    if _customer_context_contains(raw, ["fortune 500", "large enterprise", "large enterprises", "enterprise customer", "enterprise customers"]) or _contains_any(raw, ["enterprise footprint", "enterprise adoption", "enterprise customer base"]):
         customers.append("Enterprise customers")
+    if sector == "Data / AI Infrastructure" and _contains_any(raw, ["enterprise", "data", "ai platform", "ai workloads"]):
+        customers.append("CIOs, CDOs, CTOs, data teams, AI/ML teams, and enterprise platform owners")
     if _contains_any(raw, PRODUCT_DESIGN_TERMS) or (
         _contains_any(raw, ["enterprise expansion", "product love", "ai roadmap"])
         and _contains_any(raw, ["design", "prototype", "product collaboration"])
     ):
         customers.append("design, product, engineering, and enterprise software teams")
+    if _contains_any(raw, WORKSPACE_PRODUCTIVITY_TERMS):
+        customers.append("individuals, teams, startups, enterprises, knowledge workers, and product/design/engineering/ops teams")
     if _customer_context_contains(raw, ["mid-market", "mid market"]):
         customers.append("mid-market customers")
     if _customer_context_contains(raw, ["smb", "small business", "small businesses"]):
@@ -1263,7 +1892,7 @@ def extract_company_profile(state: DealMemoState) -> dict[str, Any]:
         customers.append("sustainability, finance, operations, and energy teams")
     if _contains_any(raw, ["chro", "people ops", "people operations", "talent acquisition", "recruiters", "hr teams", "employees"]):
         customers.append("HR, people operations, talent acquisition, and payroll teams")
-    if _contains_any(raw, ["supply chain", "logistics", "procurement", "warehouse", "warehouses", "carriers", "suppliers"]):
+    if sector != "Defense Technology" and _contains_any(raw, ["supply chain", "logistics", "procurement", "warehouse", "warehouses", "carriers", "suppliers"]):
         customers.append("supply chain, logistics, procurement, and operations leaders")
     if _contains_any(raw, ["manufacturing", "factory", "factories", "robotics", "robots"]):
         customers.append("operations, manufacturing, warehouse, and facilities leaders")
@@ -1281,6 +1910,9 @@ def extract_company_profile(state: DealMemoState) -> dict[str, Any]:
             risks.append(label)
 
     open_questions = []
+    for question in _extract_note_questions(raw):
+        if question not in open_questions:
+            open_questions.append(question)
     if company == "Unknown company":
         open_questions.append("What is the company name?")
     if not customers:
@@ -1303,6 +1935,7 @@ def extract_company_profile(state: DealMemoState) -> dict[str, Any]:
         "sector": sector,
         "product": product,
         "customers": customers or ["not specified"],
+        "founder_from_notes": _extract_founder(raw),
         "team": "Partner notes mention founder/team background." if _contains_any(raw, ["founder", "team", "executive"]) else "not specified",
         "market_keywords": _infer_market_keywords(product, sector),
         "risks": risks,
@@ -1389,6 +2022,21 @@ def plan_research(state: DealMemoState) -> dict[str, Any]:
                 "evidence_type": "funding",
                 "rationale": "Find funding-style evidence only after keeping identity confidence separate from memo claims.",
             },
+            {
+                "query": f"{company_for_search} founder CEO leadership official LinkedIn".strip(),
+                "evidence_type": "leadership",
+                "rationale": "Find named founders or executives without treating professional profiles as definitive verification.",
+            },
+            {
+                "query": f"{company_for_search} about founders leadership team official".strip(),
+                "evidence_type": "leadership",
+                "rationale": "Find official website/about-page leadership evidence for corroboration.",
+            },
+            {
+                "query": f"{company_for_search} founders Crunchbase CEO".strip(),
+                "evidence_type": "leadership",
+                "rationale": "Find funding/profile database evidence for founder corroboration.",
+            },
         ]
         return {
             "research_plan": plan,
@@ -1406,7 +2054,9 @@ def plan_research(state: DealMemoState) -> dict[str, Any]:
         {"query": f"{company} {product} {buyer}", "evidence_type": "website", "rationale": "Use company-specific sources to define the product, buyer, and workflow."},
         {"query": f"{company} funding investors Crunchbase", "evidence_type": "funding", "rationale": "Find funding history and investor context."},
         {"query": f"{company} news partnerships customers {product}", "evidence_type": "news", "rationale": "Find company-specific commercial momentum."},
-        {"query": f"{company} founder leadership team", "evidence_type": "leadership", "rationale": "Verify founder and team background."},
+        {"query": f"{company} founder CEO leadership official LinkedIn", "evidence_type": "leadership", "rationale": "Find named founders or executives from official, profile, or reputable public sources."},
+        {"query": f"{company} about founders leadership team official", "evidence_type": "leadership", "rationale": "Find official website/about-page leadership evidence for corroboration."},
+        {"query": f"{company} founders Crunchbase CEO", "evidence_type": "leadership", "rationale": "Find funding/profile database evidence for founder corroboration."},
         {"query": f"{company} pricing business model customers {product} {workflow}", "evidence_type": "business_model", "rationale": "Infer business model only if evidence supports it."},
         {"query": f"{workflow} competitors {competitors}", "evidence_type": "competitor", "rationale": "Validate competitors mentioned in notes against same buyer, workflow, and budget owner."},
     ]
@@ -1626,10 +2276,26 @@ def refine_company_profile_from_evidence(state: DealMemoState) -> dict[str, Any]
     product_conflicts = _product_evidence_conflicts(note_product, evidence_product, note_scope)
     note_product_known = not _is_placeholder_entity(note_product) and note_product != "Not specified"
     strong_public_product = _strong_company_product_evidence(state["evidence"], company)
+    evidence_sector = _infer_sector_from_text(company_text)
+    note_sector = profile.get("sector", "Unknown")
+    noisy_public_enrichment = (
+        evidence_product != "Not specified"
+        and note_product_known
+        and note_sector not in {"Unknown", evidence_sector}
+        and evidence_sector == "Cybersecurity / Compliance"
+    )
+    profile["public_enrichment_quality"] = {
+        "status": "noisy" if noisy_public_enrichment else "usable",
+        "reason": "Security/compliance public evidence is treated as enterprise-readiness context, not product category evidence, because partner notes anchor a different category."
+        if noisy_public_enrichment
+        else "Public enrichment did not trigger a major category-noise warning.",
+        "evidence_product": evidence_product,
+        "evidence_sector": evidence_sector,
+    }
 
     if evidence_product != "Not specified" and note_scope == "broad_platform" and not _is_placeholder_entity(note_product):
         profile["public_product_use_cases"] = public_use_cases
-        profile["product_evidence_conflicts"] = product_conflicts
+        profile["product_evidence_conflicts"] = product_conflicts + (["Public enrichment appears noisy for product categorization."] if noisy_public_enrichment else [])
         profile["market_keywords"] = _infer_market_keywords(note_product, profile.get("sector", "Unknown"))
         profile["product_source_ids"] = _source_ids_for(state["evidence"], "website") + _source_ids_for(state["evidence"], "news", limit=1)
         profile["product_source_basis"] = "partner notes preserve broad platform framing; public evidence treated as use cases"
@@ -1638,11 +2304,15 @@ def refine_company_profile_from_evidence(state: DealMemoState) -> dict[str, Any]
         profile["product_evidence_conflicts"] = product_conflicts or [
             "Public evidence differs from partner-note product framing; partner-note framing retained until diligence resolves the conflict."
         ]
+        if noisy_public_enrichment:
+            profile["product_evidence_conflicts"].append("Public enrichment appears noisy for product categorization.")
         profile["market_keywords"] = _infer_market_keywords(note_product, profile.get("sector", "Unknown"))
         profile["product_source_ids"] = _source_ids_for(state["evidence"], "website") + _source_ids_for(state["evidence"], "news", limit=1)
         profile["product_source_basis"] = "partner notes anchored product; public evidence enriches or challenges without overwriting"
     elif evidence_product != "Not specified" and strong_public_product:
         profile["product"] = evidence_product
+        if evidence_sector != "Unknown":
+            profile["sector"] = evidence_sector
         profile["public_product_use_cases"] = public_use_cases
         profile["product_evidence_conflicts"] = product_conflicts
         profile["market_keywords"] = _infer_market_keywords(evidence_product, profile.get("sector", "Unknown"))
@@ -1659,31 +2329,97 @@ def refine_company_profile_from_evidence(state: DealMemoState) -> dict[str, Any]
         profile["product_source_ids"] = []
         profile["product_source_basis"] = "partner notes only"
 
+    profile = _recover_identity_from_public_evidence(profile, state["evidence"])
     profile["company_understanding"] = _company_understanding(profile)
+    validation = profile["company_understanding"]["validation"]
+    if validation["confidence"] >= 0.8:
+        profile["confidence"] = "high"
+    elif validation["confidence"] >= 0.5:
+        profile["confidence"] = "medium"
+    else:
+        profile["confidence"] = "low"
+    errors = [
+        error
+        for error in state.get("errors", [])
+        if not (
+            profile.get("identity_resolution", {}).get("is_resolved")
+            and validation["confidence"] >= 0.8
+            and error
+            in {
+                "Unable to confidently identify company or understand workflow.",
+                "Insufficient company understanding. Need clarification before generating investment thesis.",
+            }
+        )
+    ]
     trace_payload = {
         "product": profile.get("product"),
         "product_source_basis": profile.get("product_source_basis"),
         "product_source_ids": profile.get("product_source_ids", []),
+        "public_enrichment_quality": profile.get("public_enrichment_quality", {}),
         "public_product_use_cases": profile.get("public_product_use_cases", []),
         "product_evidence_conflicts": profile.get("product_evidence_conflicts", []),
         "company_understanding": profile["company_understanding"],
     }
-    return {"company_profile": profile, "trace": _trace(state, "refine_company_profile_from_evidence", trace_payload)}
+    return {"company_profile": profile, "errors": errors, "trace": _trace(state, "refine_company_profile_from_evidence", trace_payload)}
 
 
 def _strong_company_product_evidence(evidence: list[EvidenceItem], company: str) -> bool:
-    company_lower = company.lower()
     for item in evidence:
         if item["evidence_type"] != "website":
             continue
-        text = f"{item.get('title', '')} {item.get('snippet', '')} {item.get('url', '')}".lower()
-        if company_lower and company_lower not in text:
+        text = f"{item.get('title', '')} {item.get('snippet', '')} {item.get('url', '')}"
+        if company and not _text_mentions_company_fuzzy(company, text):
             continue
         if item.get("confidence", 0) >= 0.75 and item.get("source_type") == "company_owned":
             return True
         if item.get("confidence", 0) >= 0.8 and item.get("source_tier", 3) <= 2:
             return True
     return False
+
+
+def _canonical_company_from_evidence(evidence: list[EvidenceItem], input_company: str) -> str:
+    for item in evidence:
+        if item.get("evidence_type") != "website":
+            continue
+        haystack = f"{item.get('title', '')} {item.get('snippet', '')} {item.get('url', '')}"
+        if input_company and not _text_mentions_company_fuzzy(input_company, haystack):
+            continue
+        title = re.split(r"\s+[|–—-]\s+", item.get("title", ""))[0].strip()
+        title = re.sub(r"(?i)^about\s+", "", title).strip()
+        title = re.sub(r"(?i)\s+(official|website|homepage|home)$", "", title).strip()
+        if title and len(title.split()) <= 4 and not _is_placeholder_entity(title):
+            return title
+    return input_company
+
+
+def _recover_identity_from_public_evidence(profile: dict[str, Any], evidence: list[EvidenceItem]) -> dict[str, Any]:
+    identity = dict(profile.get("identity_resolution", {}))
+    if identity.get("is_resolved"):
+        return profile
+    raw_company = profile.get("raw_company_name") or profile.get("company", "")
+    product = profile.get("product", "Not specified")
+    sector = profile.get("sector", "Unknown")
+    website_sources = _source_ids_for(evidence, "website", use="product positioning")
+    if raw_company and website_sources and product != "Not specified" and sector != "Unknown":
+        canonical = _canonical_company_from_evidence(evidence, raw_company)
+        selected = {
+            **identity.get("selected_entity", {}),
+            "name": canonical or raw_company,
+            "product": product,
+            "workflow": _competitor_framework(product, profile.get("customers", []))["primary_workflow"],
+            "buyer": _competitor_framework(product, profile.get("customers", []))["primary_buyer"],
+            "source": "public_evidence",
+            "entity_score": 0.85,
+        }
+        profile["company"] = selected["name"]
+        profile["identity_resolution"] = {
+            **identity,
+            "selected_entity": selected,
+            "confidence": 0.85,
+            "is_resolved": True,
+            "message": "Resolved from company-specific public evidence.",
+        }
+    return profile
 
 
 DEFAULT_SOURCE_USE_BY_EVIDENCE_TYPE = {
@@ -1852,13 +2588,12 @@ def _evidence_line(evidence: list[EvidenceItem], evidence_type: str, fallback: s
 
 
 def _company_specific_evidence_text(evidence: list[EvidenceItem], company: str) -> str:
-    company_lower = company.lower()
     chunks = []
     for item in evidence:
         if item["evidence_type"] not in {"website", "news", "business_model"}:
             continue
-        haystack = f"{item['title']} {item['snippet']}".lower()
-        if company_lower and company_lower in haystack:
+        haystack = f"{item['title']} {item['snippet']} {item.get('url', '')}"
+        if company and _text_mentions_company_fuzzy(company, haystack):
             chunks.append(f"{item['title']} {item['snippet']}")
     return "\n".join(chunks)
 
@@ -2355,6 +3090,18 @@ def _domain_terms(profile: dict[str, Any]) -> dict[str, str]:
             "value_metric": "buyer ROI and workflow value require clarification",
             "procurement": "the confirmed buyer and procurement process",
             "security": "security, privacy, compliance, and audit requirements appropriate to the confirmed category",
+            "workflow": product,
+        }
+    if sector == "Workspace / Productivity Software":
+        return {
+            "sales_cycle": "Enterprise productivity software adoption depends on IT approval, department-level expansion, and migration from existing tools.",
+            "integration": "Integrations with identity, file storage, Slack/email, calendars, project management, and productivity suites are central to adoption.",
+            "regulatory": "Security, privacy, permissions, retention, and compliance controls are enterprise-readiness requirements, not proof that the product is security software.",
+            "technical": "Technical risk centers on collaboration performance, permissioning, search/knowledge quality, AI retrieval quality, and migration complexity.",
+            "competition": "Competition includes productivity suites, docs/wiki tools, project-management platforms, database/workflow tools, AI workspace platforms, and internal manual workflows.",
+            "value_metric": "workspace consolidation, documentation quality, internal knowledge management, team productivity, AI-native knowledge work, and reduced tool sprawl",
+            "procurement": "IT, department, operations, and enterprise productivity procurement cycles",
+            "security": "SOC 2/security posture, permissions, data retention, admin controls, enterprise identity, and compliance readiness",
             "workflow": product,
         }
     if sector == "LegalTech":
@@ -2901,6 +3648,8 @@ def _sources_grouped_by_category(evidence: list[EvidenceItem]) -> dict[str, list
 
 WHY_NOW_DRIVERS = {
     "technology inflection": ["ai", "automation", "machine learning", "model", "llm", "robotics", "api"],
+    "workspace consolidation": ["workspace", "tool sprawl", "consolidation", "docs", "wiki", "knowledge management", "productivity suite"],
+    "AI-native knowledge work": ["ai-native", "knowledge work", "ai roadmap", "ai knowledge", "copilot", "gemini"],
     "regulatory change": ["regulatory", "compliance", "fda", "hipaa", "sec", "reporting", "audit"],
     "labor shortage": ["labor", "staffing", "clinician", "attorney", "worker", "shortage", "productivity"],
     "cost pressure": ["cost", "margin", "roi", "savings", "efficiency", "payback"],
@@ -3802,17 +4551,23 @@ def _note_lines(raw_notes: str) -> list[str]:
 def _source_note_reference_for_question(question: str, raw_notes: str) -> str:
     lines = _note_lines(raw_notes)
     lower_question = question.lower()
+    question_tokens = {
+        token
+        for token in re.findall(r"[a-z0-9]+", lower_question)
+        if len(token) > 2 and token not in {"the", "and", "for", "with", "from", "into", "what", "how", "why"}
+    }
     keyword_groups = {
         "product": ["product", "platform", "workflow"],
         "buyer": ["buyer", "customer", "customers", "end user", "budget"],
-        "competition": ["competition", "competitor", "competitors", "competitive", "vendor", "vendors"],
-        "revenue": ["revenue", "pricing", "business model", "arr", "acv", "gross margin", "retention"],
+        "competition": ["competition", "competitor", "competitors", "competitive", "vendor", "vendors", "snowflake", "win/loss", "win loss"],
+        "revenue": ["revenue", "pricing", "business model", "arr", "acv", "gross margin", "gross margins", "margin", "margins", "retention", "expansion economics", "economics"],
         "roi": ["roi", "why customers buy", "value", "payback"],
         "risk": ["risk", "security", "compliance", "regulatory", "privacy"],
         "traction": ["traction", "customers", "fortune 500", "usage", "growth"],
         "team": ["founder", "team", "sold a startup"],
         "identity": ["company", "website", "category", "actual product"],
-        "market": ["market", "tam"],
+        "market": ["market", "tam", "ai workloads", "workloads"],
+        "open_source": ["open-source", "open source", "open-source strategy", "open source strategy", "ecosystem", "strategy"],
     }
     wanted = {
         key
@@ -3834,7 +4589,12 @@ def _source_note_reference_for_question(question: str, raw_notes: str) -> str:
         }
         if wanted and not (matched_groups & wanted):
             continue
-        exact_bonus = 0
+        line_tokens = {
+            token
+            for token in re.findall(r"[a-z0-9]+", lower_line)
+            if len(token) > 2
+        }
+        exact_bonus = min(3, len(question_tokens & line_tokens))
         score = len(matched_groups & wanted) * 3 + len(matched_groups) + exact_bonus
         if score > best_score:
             best_score = score
@@ -3886,6 +4646,60 @@ def _unknown_category_diligence_priorities(company: str, profile: dict[str, Any]
 def _next_diligence_priorities(company: str, profile: dict[str, Any]) -> dict[str, list[dict[str, str]]]:
     sector = profile.get("sector", "Unknown")
     terms = _domain_terms(profile)
+    if sector == "Data / AI Infrastructure":
+        return _ground_diligence_priorities(profile.get("raw_notes", ""), {
+            "Commercial traction": [
+                f"Validate {company}'s ARR, NRR, workload growth, enterprise penetration, and expansion by customer cohort.",
+                "Separate data warehousing, lakehouse, governance, ML/AI, and model-serving workloads by revenue contribution.",
+            ],
+            "Customer ROI": [
+                "Quantify data-team productivity, infrastructure consolidation, workload performance, AI deployment velocity, and platform standardization.",
+                "Run references with CIO/CDO/CTO, data engineering, ML platform, and analytics leaders on usage depth and switching behavior.",
+            ],
+            "Product / integration": [
+                "Review lakehouse/data warehouse performance, governance, catalog, lineage, security, ML/AI workflow depth, and cloud integrations.",
+                "Assess open-source strategy, managed-service conversion, ecosystem leverage, and migration burden.",
+            ],
+            "Competition": [
+                "Map Snowflake competition plus overlap with BigQuery, Redshift, Microsoft Fabric, Palantir, dbt, open-source Spark, and internal data platforms.",
+                "Identify whether differentiation comes from lakehouse architecture, AI workload depth, open-source ecosystem, governance, performance, or cloud neutrality.",
+            ],
+            "Financials": [
+                "Request gross margin after cloud infrastructure and compute costs, consumption visibility, committed spend, CAC payback, burn, and runway.",
+                "Stress-test margin durability as AI workloads grow and cloud providers compete.",
+            ],
+            "Regulatory / security": [
+                "Verify data security, governance, privacy, auditability, access controls, data residency, and enterprise compliance posture.",
+                "Review customer data usage, model governance, and regulatory exposure for AI/data workloads.",
+            ],
+        })
+    if sector == "Workspace / Productivity Software":
+        return _ground_diligence_priorities(profile.get("raw_notes", ""), {
+            "Commercial traction": [
+                f"Validate {company}'s ARR, paid customer count, enterprise penetration, seat expansion, retention, and NRR.",
+                "Separate individual/team adoption from enterprise-wide deployments and paid expansion.",
+            ],
+            "Customer ROI": [
+                "Quantify productivity gains, tool consolidation, documentation quality, project visibility, and reduced knowledge-search time.",
+                "Run references with team admins, IT, operations, and knowledge workers on daily usage and switching behavior.",
+            ],
+            "Product / integration": [
+                "Review docs, wiki, project tracking, database/workflow depth, permissions, admin controls, migration, and AI roadmap.",
+                "Assess integrations with Microsoft 365, Google Workspace, Slack/email, calendars, identity, and file storage.",
+            ],
+            "Competition": [
+                "Map Microsoft competition, Google Workspace bundling, Confluence/Coda overlap, Asana/ClickUp/Monday.com overlap, Airtable/Smartsheet overlap, and internal docs/spreadsheets/Slack workflows.",
+                "Identify whether differentiation comes from workspace consolidation, product affinity, AI-native knowledge work, collaboration depth, or ecosystem integrations.",
+            ],
+            "Financials": [
+                "Request pricing, ACV, gross margin, CAC payback, seat expansion, workspace expansion, burn, and runway.",
+                "Stress-test retention if Microsoft, Google, or Atlassian bundle similar AI/productivity workflows.",
+            ],
+            "Regulatory / security": [
+                f"Verify {terms['security']}.",
+                "Treat security/compliance findings as enterprise-readiness diligence unless evidence shows the company is actually a security or compliance vendor.",
+            ],
+        })
     if sector == "LegalTech":
         return _ground_diligence_priorities(profile.get("raw_notes", ""), {
             "Commercial traction": [
@@ -4009,6 +4823,8 @@ def _competitive_table(profile: dict[str, Any], evidence: list[EvidenceItem]) ->
                 "company": "Relevant competitors could not be confidently identified from current evidence.",
                 "buyer": understanding.get("target_buyer", "Unknown"),
                 "workflow": understanding.get("core_workflow", "Unknown"),
+                "replacement_target": "Unknown",
+                "job_to_be_done": "Requires validation.",
                 "threat_level": "Low confidence",
                 "why_it_competes": "Company profile is insufficient to identify economic competitors without fabricating.",
                 "competitor_score": None,
@@ -4039,6 +4855,8 @@ def _competitive_landscape(profile: dict[str, Any], evidence: list[EvidenceItem]
     budget_owner = understanding.get("budget_owner", "Unknown")
     workflow = understanding.get("core_workflow", "Unknown")
     category = understanding.get("product_category", "Unknown")
+    replacement_target = _replacement_target_for_competition(category, workflow)
+    job_to_be_done = _job_to_be_done_for_competition(buyer, workflow)
     competitor_sources = _source_ids_for(evidence, "competitor", use="competitor discovery")
     framework = _filter_competitor_framework(
         _competitor_framework(understanding.get("primary_product", profile.get("product", "")), buyer),
@@ -4070,6 +4888,8 @@ def _competitive_landscape(profile: dict[str, Any], evidence: list[EvidenceItem]
                 "competitor_group": group,
                 "examples": names,
                 "why_it_competes": _group_competition_reason(group, buyer, budget_owner, workflow, category),
+                "replacement_target": replacement_target,
+                "job_to_be_done": job_to_be_done,
                 "buyer_overlap": _group_overlap(group, "buyer"),
                 "workflow_overlap": _group_overlap(group, "workflow"),
                 "budget_overlap": _group_overlap(group, "budget"),
@@ -4079,7 +4899,7 @@ def _competitive_landscape(profile: dict[str, Any], evidence: list[EvidenceItem]
             }
         )
     return {
-        "summary": f"Competition is mapped by economic overlap with {buyer}, {budget_owner} budget, and the {workflow} workflow; this avoids treating keyword-adjacent companies as true competitors.",
+        "summary": f"Competition is mapped by economic overlap with {buyer}, {budget_owner} budget, the {workflow} workflow, the replacement target ({replacement_target}), and the job-to-be-done ({job_to_be_done}).",
         "rows": rows,
     }
 
@@ -4155,6 +4975,8 @@ def _discover_economic_competitors(profile: dict[str, Any], evidence: list[Evide
     budget_owner = understanding.get("budget_owner", "Unknown")
     workflow = understanding.get("core_workflow", framework["primary_workflow"])
     category = understanding.get("product_category", framework["product_category"])
+    replacement_target = _replacement_target_for_competition(category, workflow)
+    job_to_be_done = _job_to_be_done_for_competition(buyer, workflow)
     competitor_sources = _source_ids_for(evidence, "competitor")
 
     rows: list[dict[str, Any]] = []
@@ -4175,13 +4997,20 @@ def _discover_economic_competitors(profile: dict[str, Any], evidence: list[Evide
             confidence = "High" if group_name == "Direct Competitors" and competitor_sources else "Medium"
             if confidence not in {"Medium", "High"}:
                 continue
+            competitor_context = _competitor_row_context(name, group_name, buyer, workflow, category, budget_owner)
             rows.append(
                 {
                     "company": name,
-                    "buyer": buyer,
-                    "workflow": workflow,
+                    "buyer": competitor_context["buyer"],
+                    "workflow": competitor_context["workflow"],
                     "budget_owner": budget_owner,
+                    "replacement_target": competitor_context["replacement_target"] or replacement_target,
+                    "job_to_be_done": competitor_context["job_to_be_done"] or job_to_be_done,
                     "category": group_name,
+                    "similarity_tier": _competitor_similarity_tier(group_name, score),
+                    "differentiation_factors": _competitor_differentiation_factors(group_name, name, workflow, category),
+                    "funding_info": _competitor_funding_info(name, group_name, evidence),
+                    "revenue_available": _competitor_revenue_info(name, group_name, evidence),
                     "threat_level": _threat_level(score),
                     "why_it_competes": _competitor_reason(group_name, buyer, budget_owner, workflow, category),
                     "buyer_overlap": overlaps["buyer_overlap"],
@@ -4196,12 +5025,293 @@ def _discover_economic_competitors(profile: dict[str, Any], evidence: list[Evide
     return sorted(rows, key=lambda row: row["competitor_score"], reverse=True)
 
 
+def _competitor_row_context(company: str, group_name: str, buyer: str, workflow: str, category: str, budget_owner: str) -> dict[str, str]:
+    name = company.lower()
+    category_text = f"{group_name} {category} {workflow}".lower()
+    if "internal" in group_name.lower() or "manual" in name:
+        return {
+            "buyer": buyer,
+            "workflow": "manual process, internal tools, spreadsheets, email, and existing team routines",
+            "replacement_target": "status quo workflow and internal build effort",
+            "job_to_be_done": f"Avoid adopting a new vendor unless ROI clearly exceeds switching and implementation cost for {buyer}.",
+        }
+    workspace_contexts = {
+        "microsoft": ("CIO / IT and department leaders", "Microsoft 365, Teams, SharePoint, Loop, and Copilot productivity workflows", "bundled Microsoft workspace suite"),
+        "google": ("IT, operations, and department leaders", "Google Workspace docs, collaboration, storage, and Gemini-enabled productivity workflows", "bundled Google Workspace suite"),
+        "atlassian": ("engineering, product, IT, and operations teams", "Confluence/Jira knowledge, planning, and project-tracking workflows", "existing Atlassian system-of-work footprint"),
+        "confluence": ("engineering, product, IT, and operations teams", "wiki, knowledge-base, and engineering documentation workflows", "existing Confluence/wiki deployment"),
+        "coda": ("operators, product teams, and knowledge workers", "docs-as-apps, lightweight workflow, and team planning workflows", "flexible docs/workflow app"),
+        "airtable": ("operations, product, marketing, and business teams", "spreadsheet-database workflows, lightweight apps, and structured tracking", "spreadsheet/database workflow layer"),
+        "asana": ("operations, product, marketing, and project teams", "project management, task tracking, portfolio visibility, and execution workflows", "dedicated project-management platform"),
+        "clickup": ("operations, product, engineering, and cross-functional teams", "task/project management, docs, dashboards, and productivity workspace workflows", "all-in-one project-management workspace"),
+        "monday": ("operations, sales, marketing, and project teams", "work management, project tracking, and cross-functional execution workflows", "work-management platform"),
+        "linear": ("product and engineering teams", "issue tracking, product planning, and engineering execution workflows", "engineering/product execution system"),
+        "slack": ("knowledge workers, IT, and department leaders", "messaging-centered collaboration, workflow notifications, and knowledge discovery", "team communication hub"),
+        "dropbox paper": ("knowledge workers, product teams, and lightweight collaboration users", "document collaboration, lightweight docs, comments, and file-adjacent knowledge sharing", "Dropbox-adjacent document collaboration tool"),
+    }
+    for key, (specific_buyer, specific_workflow, replacement) in workspace_contexts.items():
+        if key in name:
+            return {
+                "buyer": specific_buyer,
+                "workflow": specific_workflow,
+                "replacement_target": replacement,
+                "job_to_be_done": f"Help {specific_buyer} coordinate work and knowledge with less tool sprawl and manual follow-up.",
+            }
+    if _contains_any(category_text, ["design", "prototype", "design systems"]):
+        design_contexts = {
+            "adobe": ("design leaders, creative teams, and enterprise IT", "creative design suite, XD/Figma-adjacent design workflows, and enterprise creative tooling", "Adobe Creative Cloud / design suite relationship"),
+            "canva": ("marketing, design, and business teams", "lightweight design, brand templates, presentations, and visual collaboration", "visual design and brand-production workflow"),
+            "miro": ("product, design, engineering, and workshop teams", "whiteboarding, ideation, diagramming, and async product collaboration", "digital whiteboard / workshop workflow"),
+            "sketch": ("product design and UI teams", "interface design, prototyping, and mac-native design workflows", "legacy interface-design tool"),
+            "framer": ("design, product, and growth teams", "interactive prototyping, website publishing, and design-to-web workflows", "web/prototyping workflow"),
+        }
+        for key, (specific_buyer, specific_workflow, replacement) in design_contexts.items():
+            if key in name:
+                return {
+                    "buyer": specific_buyer,
+                    "workflow": specific_workflow,
+                    "replacement_target": replacement,
+                    "job_to_be_done": f"Help {specific_buyer} move from design idea to prototype, handoff, or published experience faster.",
+                }
+    if _contains_any(category_text, ["spend", "expense", "procurement", "corporate card"]):
+        fintech_contexts = {
+            "brex": ("CFOs, controllers, and finance teams", "corporate cards, expense management, travel, and spend controls", "modern corporate-card and spend-management platform"),
+            "airbase": ("CFOs, controllers, accounting, and procurement teams", "AP, bill pay, expense approvals, procurement intake, and spend controls", "procure-to-pay / AP automation suite"),
+            "navan": ("finance, travel managers, and employees", "travel booking, expense management, corporate cards, and travel policy compliance", "travel-and-expense platform"),
+            "amex": ("CFOs, finance teams, and card administrators", "corporate cards, rewards, travel, purchasing controls, and payments", "incumbent corporate-card program"),
+            "american express": ("CFOs, finance teams, and card administrators", "corporate cards, rewards, travel, purchasing controls, and payments", "incumbent corporate-card program"),
+            "coupa": ("procurement, finance, and operations leaders", "procurement, spend management, supplier management, and sourcing workflows", "enterprise procurement suite"),
+            "bill": ("finance and accounting teams", "AP/AR automation, payments, bill pay, and SMB finance workflows", "AP/payment workflow platform"),
+            "mercury": ("startup founders, finance teams, and operators", "business banking, treasury, bill pay, and startup finance workflows", "startup banking and finance operating account"),
+        }
+        for key, (specific_buyer, specific_workflow, replacement) in fintech_contexts.items():
+            if key in name:
+                return {
+                    "buyer": specific_buyer,
+                    "workflow": specific_workflow,
+                    "replacement_target": replacement,
+                    "job_to_be_done": f"Help {specific_buyer} control spend, automate payments, and improve finance visibility.",
+                }
+    if _contains_any(category_text, ["defense", "military", "mission software", "autonomous systems", "sensors"]):
+        defense_contexts = {
+            "shield ai": (
+                "defense program offices, autonomy teams, and military operators",
+                "autonomous aircraft, unmanned systems, edge autonomy, and ISR mission workflows",
+                "drone/autonomy programs and unmanned aircraft procurement",
+            ),
+            "general atomics": (
+                "defense procurement officials, air force/naval program offices, and ISR operators",
+                "large unmanned aircraft systems, ISR payloads, ground control, and sustainment workflows",
+                "incumbent UAS platform and program-of-record procurement",
+            ),
+            "palantir": (
+                "defense CIOs, intelligence users, program offices, and operations commanders",
+                "mission data integration, battlefield decision software, AI-enabled operations, and command workflows",
+                "mission-data platform and government software budget",
+            ),
+            "lockheed martin": (
+                "defense acquisition offices, program executive offices, and military services",
+                "prime-contractor weapons systems, C2, sensors, aircraft, missiles, and integrated defense programs",
+                "prime-contractor program bundle and systems-integration relationship",
+            ),
+            "northrop grumman": (
+                "defense acquisition offices, ISR/satellite program offices, and military services",
+                "aerospace, ISR, autonomy, space, C2, and integrated defense systems workflows",
+                "prime aerospace/ISR program and systems-integration relationship",
+            ),
+            "raytheon": (
+                "defense acquisition offices, air-defense program offices, and military services",
+                "missile defense, radar, sensors, C2, and integrated air-defense workflows",
+                "incumbent missile/sensor defense program",
+            ),
+        }
+        for key, (specific_buyer, specific_workflow, replacement) in defense_contexts.items():
+            if key in name:
+                return {
+                    "buyer": specific_buyer,
+                    "workflow": specific_workflow,
+                    "replacement_target": replacement,
+                    "job_to_be_done": f"Help {specific_buyer} field mission capability faster, cheaper, or with better software integration.",
+                }
+        return {
+            "buyer": "defense program sponsors, government buyers, and military operators",
+            "workflow": "mission planning, autonomous systems, sensor fusion, command workflows, and field operations",
+            "replacement_target": "defense primes, legacy systems, internal government programs, and manual mission workflows",
+            "job_to_be_done": "Deliver deployable mission capability through a faster procurement and integration path.",
+        }
+    return {
+        "buyer": buyer,
+        "workflow": workflow,
+        "replacement_target": _replacement_target_for_competition(category, workflow),
+        "job_to_be_done": _job_to_be_done_for_competition(buyer, workflow),
+    }
+
+
+def _competitor_similarity_tier(group_name: str, score: float) -> str:
+    direct_like = {"Direct Competitors", "Productivity Suites", "Docs / Wiki / Collaboration", "Project Management", "Database / Workflow Tools"}
+    adjacent_like = {"Adjacent Competitors", "Horizontal AI / Workspace Platforms"}
+    incumbent_like = {"Incumbents", "Internal / Manual Workflow"}
+    if group_name in direct_like or score >= 8:
+        return "Direct / high similarity"
+    if group_name in adjacent_like or score >= 6:
+        return "Adjacent / medium similarity"
+    if group_name in incumbent_like:
+        return "Incumbent or replacement workflow"
+    return "Requires validation"
+
+
+def _competitor_differentiation_factors(group_name: str, company: str, workflow: str, category: str) -> str:
+    lower_group = group_name.lower()
+    lower_name = company.lower()
+    text = f"{workflow} {category}".lower()
+    named = {
+        "microsoft": "Differentiate against bundle pricing, Microsoft 365 admin footprint, Copilot distribution, and IT standardization.",
+        "google": "Differentiate against Google Workspace collaboration defaults, Gemini bundling, and low-friction docs adoption.",
+        "atlassian": "Differentiate against Jira/Confluence depth in engineering organizations and existing Atlassian procurement.",
+        "confluence": "Differentiate on ease of use, flexible databases/workflows, AI knowledge retrieval, and cross-functional adoption.",
+        "coda": "Differentiate on breadth of workspace adoption, enterprise controls, docs-as-apps flexibility, and migration effort.",
+        "airtable": "Differentiate against structured database/workflow flexibility, reporting, and operations-team app building.",
+        "asana": "Differentiate against mature project-management workflows, portfolio visibility, and executive reporting.",
+        "clickup": "Differentiate against all-in-one breadth, lower-cost consolidation pitch, and task-management depth.",
+        "monday": "Differentiate against work-management templates, operational dashboards, and department-level adoption.",
+        "linear": "Differentiate against product/engineering workflow speed, issue-tracking depth, and developer affinity.",
+        "dropbox paper": "Differentiate against simple document collaboration, Dropbox distribution, and lightweight knowledge-sharing workflows.",
+        "adobe": "Differentiate against Adobe's creative-suite distribution, procurement relationships, and AI/design asset ecosystem.",
+        "canva": "Differentiate against ease of use, brand/template workflows, and marketing-team virality.",
+        "miro": "Differentiate against whiteboarding, workshop, and product-discovery collaboration depth.",
+        "sketch": "Differentiate against legacy design workflows, file compatibility, and designer switching inertia.",
+        "framer": "Differentiate against design-to-web publishing, interactive prototyping, and growth-site workflows.",
+        "brex": "Differentiate against corporate-card brand, startup/mid-market finance adoption, travel, and spend controls.",
+        "airbase": "Differentiate against AP/procurement workflow depth, accounting controls, and procure-to-pay functionality.",
+        "navan": "Differentiate against travel-and-expense workflow depth, traveler experience, and travel-policy controls.",
+        "amex": "Differentiate against incumbent card relationships, rewards economics, credit capacity, and enterprise trust.",
+        "coupa": "Differentiate against enterprise procurement breadth, supplier network, and incumbent procurement workflows.",
+        "bill": "Differentiate against AP/payment workflow depth, SMB finance distribution, and accounting integrations.",
+        "mercury": "Differentiate against business banking distribution, treasury workflows, startup mindshare, and account-level finance data.",
+        "shield ai": "Differentiate against autonomous-aircraft depth, deployed autonomy credibility, defense relationships, and field performance.",
+        "general atomics": "Differentiate against incumbent UAS program-of-record status, airframe maturity, payload integration, and sustainment footprint.",
+        "palantir": "Differentiate against mission-data platform depth, government software relationships, ontology/workflow integration, and AI deployment credibility.",
+        "lockheed martin": "Differentiate against prime-contractor bundling, classified program access, systems-integration breadth, and procurement incumbency.",
+        "northrop grumman": "Differentiate against ISR/space/aerospace program depth, prime relationships, sustainment scale, and classified integration.",
+        "raytheon": "Differentiate against missile/sensor incumbency, radar and air-defense depth, program access, and production scale.",
+    }
+    for key, value in named.items():
+        if key in lower_name:
+            return value
+    if "productivity suites" in lower_group:
+        return "Differentiate against bundle breadth, admin controls, enterprise distribution, and suite-native AI."
+    if "docs / wiki" in lower_group:
+        return "Differentiate on workspace flexibility, knowledge retrieval, collaboration depth, and ease of migration."
+    if "project management" in lower_group:
+        return "Differentiate on structured execution workflows, visibility, adoption, and cross-functional collaboration."
+    if "database" in lower_group:
+        return "Differentiate on database/workflow flexibility, permissions, automation, and reporting."
+    if "horizontal ai" in lower_group:
+        return "Differentiate on AI-native workflow depth, proprietary context, and daily workspace adoption."
+    if "internal" in lower_group:
+        return "Prove ROI versus status quo, migration effort, and manual process inertia."
+    if "design" in text:
+        return "Differentiate on collaboration quality, workflow depth, design-system adoption, developer handoff, and AI roadmap."
+    if "legal" in text or "contract" in text:
+        return "Differentiate on accuracy, workflow depth, integrations, trust, confidentiality, and legal-review outcomes."
+    if "spend" in text or "procurement" in text or "expense" in text:
+        return "Differentiate on finance workflow depth, controls, savings, software attach, and ERP/procurement integrations."
+    if "healthcare" in text or "clinical" in text:
+        return "Differentiate on workflow fit, integration depth, clinical/admin ROI, trust, and compliance readiness."
+    if "defense" in text or "military" in text or "mission" in text:
+        return "Differentiate on deployment speed, mission software depth, hardware/software integration, procurement path, and field performance."
+    return f"Validate why buyers choose {company} versus alternatives on workflow depth, ROI, integration, and switching cost."
+
+
+def _evidence_mentions_competitor(item: EvidenceItem, competitor: str) -> bool:
+    normalized = _normalized_company_name(competitor)
+    text = _normalized_company_name(f"{item.get('title', '')} {item.get('snippet', '')} {item.get('url', '')}")
+    return bool(normalized and normalized in text)
+
+
+def _source_ids_mentioning_competitor(evidence: list[EvidenceItem], competitor: str, keywords: list[str]) -> list[str]:
+    matches = []
+    for item in evidence:
+        text = f"{item.get('title', '')} {item.get('snippet', '')}".lower()
+        if _evidence_mentions_competitor(item, competitor) and any(keyword in text for keyword in keywords):
+            matches.append(item["source_id"])
+    return matches[:2]
+
+
+def _competitor_funding_info(competitor: str, group_name: str, evidence: list[EvidenceItem]) -> str:
+    source_ids = _source_ids_mentioning_competitor(
+        evidence,
+        competitor,
+        ["funding", "raised", "series", "valuation", "investor", "ipo", "public company"],
+    )
+    if source_ids:
+        return f"Evidence found: {', '.join(source_ids)}"
+    lower = competitor.lower()
+    if any(name in lower for name in ["microsoft", "google", "adobe", "atlassian", "salesforce", "oracle", "sap", "amex", "american express"]):
+        return "Public incumbent; use filings/investor materials for scale, not startup funding."
+    if group_name in {"Productivity Suites", "Incumbents", "Horizontal AI / Workspace Platforms"}:
+        return "Likely public/incumbent scale; verify filings or investor materials."
+    if group_name == "Internal / Manual Workflow":
+        return "Not applicable."
+    if group_name in {"Direct Competitors", "Adjacent Competitors", "Docs / Wiki / Collaboration", "Project Management", "Database / Workflow Tools"}:
+        return "Private-company funding requires source validation."
+    return "Funding not found in current evidence."
+
+
+def _competitor_revenue_info(competitor: str, group_name: str, evidence: list[EvidenceItem]) -> str:
+    source_ids = _source_ids_mentioning_competitor(
+        evidence,
+        competitor,
+        ["revenue", "arr", "annual recurring", "sales", "segment", "earnings", "annual report"],
+    )
+    if source_ids:
+        return f"Evidence found: {', '.join(source_ids)}"
+    lower = competitor.lower()
+    if any(name in lower for name in ["microsoft", "google", "adobe", "atlassian", "salesforce", "oracle", "sap", "amex", "american express"]):
+        return "Public-company revenue available at parent/segment level; verify product-level relevance."
+    if group_name in {"Productivity Suites", "Incumbents", "Horizontal AI / Workspace Platforms"}:
+        return "Public-company revenue data may be available; verify segment relevance."
+    if group_name == "Internal / Manual Workflow":
+        return "Not applicable; compare internal cost/time."
+    if group_name in {"Direct Competitors", "Adjacent Competitors", "Docs / Wiki / Collaboration", "Project Management", "Database / Workflow Tools"}:
+        return "Private revenue not found; request ARR/scale benchmarks if material."
+    return "Revenue not found in current evidence."
+
+
+def _replacement_target_for_competition(category: str, workflow: str) -> str:
+    text = f"{category} {workflow}".lower()
+    if _contains_any(text, ["workspace", "productivity", "docs", "wiki", "knowledge", "project tracking"]):
+        return "existing docs, wikis, project-management tools, productivity suites, and manual Slack/email/spreadsheet workflows"
+    if _contains_any(text, ["design", "prototype", "design systems"]):
+        return "existing design, prototyping, whiteboarding, developer-handoff, and product-collaboration tools"
+    if _contains_any(text, ["legal", "contract"]):
+        return "legal review tools, CLM systems, outside counsel workflows, and manual attorney review"
+    if _contains_any(text, ["spend", "expense", "procurement", "corporate card"]):
+        return "corporate cards, expense tools, procurement suites, AP workflows, and manual finance controls"
+    if _contains_any(text, ["defense", "military", "mission software", "autonomous systems", "drones", "sensors"]):
+        return "defense primes, program-of-record systems, internal government programs, legacy ISR/drone systems, and manual mission workflows"
+    if _contains_any(text, ["healthcare", "clinical", "documentation", "prior authorization", "revenue cycle"]):
+        return "existing clinical/admin workflow systems, incumbent vendors, and manual healthcare operations"
+    return f"existing tools and manual workflows used for {workflow}"
+
+
+def _job_to_be_done_for_competition(buyer: str, workflow: str) -> str:
+    if _is_placeholder_entity(workflow):
+        return "The job-to-be-done requires validation."
+    if _is_placeholder_entity(buyer):
+        return f"Complete {workflow} with less manual work, faster cycle time, and better operating visibility."
+    return f"Help {buyer} complete {workflow} with less manual work, faster cycle time, and better operating visibility."
+
+
 def _competitor_overlap_scores(group_name: str) -> dict[str, int]:
-    if group_name == "Direct Competitors":
+    direct_like = {"Direct Competitors", "Productivity Suites", "Docs / Wiki / Collaboration", "Project Management", "Database / Workflow Tools"}
+    adjacent_like = {"Adjacent Competitors", "Horizontal AI / Workspace Platforms"}
+    incumbent_like = {"Incumbents", "Internal / Manual Workflow"}
+    if group_name in direct_like:
         return {"workflow_overlap": 9, "buyer_overlap": 9, "budget_overlap": 9, "category_overlap": 9}
-    if group_name == "Adjacent Competitors":
+    if group_name in adjacent_like:
         return {"workflow_overlap": 7, "buyer_overlap": 8, "budget_overlap": 7, "category_overlap": 6}
-    if group_name == "Incumbents":
+    if group_name in incumbent_like:
         return {"workflow_overlap": 6, "buyer_overlap": 8, "budget_overlap": 8, "category_overlap": 5}
     return {"workflow_overlap": 4, "buyer_overlap": 4, "budget_overlap": 4, "category_overlap": 4}
 
@@ -4217,11 +5327,14 @@ def _threat_level(score: float) -> str:
 
 
 def _competitor_reason(group_name: str, buyer: str, budget_owner: str, workflow: str, category: str) -> str:
-    if group_name == "Direct Competitors":
+    direct_like = {"Direct Competitors", "Productivity Suites", "Docs / Wiki / Collaboration", "Project Management", "Database / Workflow Tools"}
+    adjacent_like = {"Adjacent Competitors", "Horizontal AI / Workspace Platforms"}
+    incumbent_like = {"Incumbents", "Internal / Manual Workflow"}
+    if group_name in direct_like:
         return f"Competes for the same {budget_owner} budget, same buyer ({buyer}), and same workflow: {workflow}."
-    if group_name == "Adjacent Competitors":
+    if group_name in adjacent_like:
         return f"Adjacent product that can compete for related {budget_owner} budget and workflow expansion around {workflow}."
-    if group_name == "Incumbents":
+    if group_name in incumbent_like:
         return f"Incumbent alternative already near the {buyer} purchasing decision and {budget_owner} budget."
     return f"Potential overlap with {category}; requires verification."
 
@@ -4273,6 +5386,8 @@ def write_structured_memo(state: DealMemoState) -> dict[str, Any]:
     investment_confidence = _investment_thesis_confidence(evidence)
     business_confidence = _business_model_confidence(evidence)
     competition_confidence = _competition_confidence(evidence)
+    founding_team = _founding_team_profile(profile, evidence)
+    founding_team_sources = founding_team.get("source_ids", [])
     domain_terms = _domain_terms(profile)
     evidence_dashboard = _evidence_dashboard(evidence)
     identity_resolution = profile.get("identity_resolution", {})
@@ -4364,6 +5479,7 @@ def write_structured_memo(state: DealMemoState) -> dict[str, Any]:
             _claim(f"Security, privacy, and compliance posture must satisfy {domain_terms['procurement']}.", news_sources, inference=True),
         ],
         "partner_note_verification": _partner_claims(profile, evidence),
+        "founding_team": founding_team,
         "company_understanding": understanding,
         "evidence_dashboard": evidence_dashboard,
         "next_diligence_priorities": _next_diligence_priorities(company, profile),
@@ -4394,11 +5510,11 @@ def write_structured_memo(state: DealMemoState) -> dict[str, Any]:
             _score_or_unknown(
                 "Team",
                 f"Team score is the average of founder-market fit, execution track record, and {sector.lower()} depth.",
-                leadership_sources,
+                founding_team_sources or leadership_sources,
                 [
-                    _factor("Founder-market fit", 6 if leadership_sources else None, "Founder-market fit requires independent leadership evidence.", leadership_sources),
+                    _factor("Founder-market fit", 6 if founding_team.get("people") else None, "Founder-market fit requires named founder/team evidence.", founding_team_sources or leadership_sources),
                     _factor("Execution track record", None, "Execution history is not verified from current public evidence.", []),
-                    _factor(f"{sector} depth", 6 if leadership_sources else None, "Domain depth requires founder/team biography verification.", leadership_sources),
+                    _factor(f"{sector} depth", 6 if founding_team_sources else None, "Domain depth requires founder/team biography verification.", founding_team_sources),
                 ],
                 inference=True,
             ),
@@ -4472,7 +5588,7 @@ def write_structured_memo(state: DealMemoState) -> dict[str, Any]:
         },
         "section_confidence": {
             "Company Overview": _section_confidence(evidence, "website"),
-            "Founding Team": _section_confidence(evidence, "leadership"),
+            "Founding Team": founding_team.get("confidence", _section_confidence(evidence, "leadership")),
             "Product": _section_confidence(evidence, "website"),
             "Market Opportunity": _section_confidence(evidence, "market"),
             "Competitive Landscape": competition_confidence,
@@ -4483,7 +5599,7 @@ def write_structured_memo(state: DealMemoState) -> dict[str, Any]:
         },
         "sections": [
             {"title": "Company Overview", "claims": [_claim(product_scope_summary, website_sources, note=True, inference=True)]},
-            {"title": "Founding Team", "claims": [_claim(profile.get("team", "Team background requires diligence."), leadership_sources, note=True)]},
+            {"title": "Founding Team", "claims": [_claim(founding_team.get("summary", "Founding team: Unknown."), founding_team_sources, note=any(person.get("note_reference") for person in founding_team.get("people", [])), inference=founding_team.get("status") == "Unknown")]},
             {"title": "Product", "claims": [_claim(f"{product_scope_summary} Company-specific evidence: {website_fact}", product_source_ids or website_sources, note=True, inference=True)]},
             {"title": "Why Now", "claims": [
                 _claim(f"Partner notes frame urgency around {product.lower()} and {domain_terms['value_metric']}.", note=True),

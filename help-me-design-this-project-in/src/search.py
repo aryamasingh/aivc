@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from difflib import SequenceMatcher
 import os
 import re
 from urllib.parse import urlparse
@@ -53,37 +54,54 @@ LOW_QUALITY_DOMAINS = (
     "quora.com",
     "x.com",
     "twitter.com",
+    "g2.com",
+    "capterra.com",
+    "softwareadvice.com",
+    "getapp.com",
+    "saasworthy.com",
+    "sourceforge.net",
+    "slashdot.org",
 )
 
-TIER_1_INSTITUTIONAL_DOMAINS = (
+TIER_1_ALLOWLIST_DOMAINS = (
     "sec.gov",
+    ".gov",
+    ".mil",
+    "edgar.sec.gov",
     "crunchbase.com",
     "pitchbook.com",
     "reuters.com",
     "bloomberg.com",
     "wsj.com",
-    "wsj.com",
-)
-
-TIER_2_DOMAINS = (
+    "ft.com",
     "businesswire.com",
     "prnewswire.com",
-    "ft.com",
+    "globenewswire.com",
+)
+
+TIER_2_ALLOWLIST_DOMAINS = (
     "cnbc.com",
     "forbes.com",
     "techcrunch.com",
+    "theinformation.com",
+    "gartner.com",
+    "forrester.com",
+    "cbinsights.com",
+    "dealroom.co",
+    "tracxn.com",
     "fiercehealthcare.com",
     "healthcaredive.com",
     "healthcareitnews.com",
     "modernhealthcare.com",
     "beckershospitalreview.com",
     "statnews.com",
-    "theinformation.com",
-    "gartner.com",
-    "forrester.com",
+    "law.com",
+    "legaltechnology.com",
+    "sifted.eu",
+    "eu-startups.com",
 )
 
-LISTICLE_TERMS = ("top ", "best ", "alternatives", "listicle", "review sites", "reviews", "comparison")
+LISTICLE_TERMS = ("top ", "best ", "alternatives", "listicle", "review sites", "reviews", "comparison", "top 10", "top ten")
 FUNDING_DATABASE_DOMAINS = ("crunchbase.com", "pitchbook.com", "tracxn.com", "cbinsights.com", "dealroom.co")
 REPUTABLE_NEWS_DOMAINS = (
     "reuters.com",
@@ -102,7 +120,8 @@ REPUTABLE_NEWS_DOMAINS = (
 WIRE_DOMAINS = ("businesswire.com", "prnewswire.com", "globenewswire.com")
 PROFESSIONAL_PROFILE_DOMAINS = ("linkedin.com", "theorg.com", "apollo.io", "zoominfo.com", "crunchbase.com/people")
 VENDOR_COMPARISON_TERMS = ("alternatives", "compare", "comparison", "vs ", " versus ", "competitors")
-SEO_TERMS = ("best ", "top ", "review", "reviews", "listicle", "buyers guide", "buyer guide")
+SEO_TERMS = ("best ", "top ", "top 10", "top ten", "review", "reviews", "listicle", "buyers guide", "buyer guide", "ultimate guide")
+CONTENT_FARM_TERMS = ("content farm", "ai-generated", "scraped", "directory", "software directory")
 
 SOURCE_POLICIES = {
     "company_owned": {
@@ -154,6 +173,14 @@ RELEVANCE_STOPWORDS = {
     "context",
     "customers",
     "customer",
+    "product",
+    "products",
+    "team",
+    "teams",
+    "enterprise",
+    "enterprises",
+    "collaboration",
+    "collaborative",
     "pricing",
     "business",
     "model",
@@ -172,6 +199,24 @@ def _meaningful_tokens(text: str) -> set[str]:
     }
 
 
+def _fuzzy_query_entity_match(query: str, result_text: str) -> bool:
+    query_tokens = [
+        token
+        for token in re.split(r"[^a-z0-9]+", query.lower())
+        if len(token) > 2 and token not in RELEVANCE_STOPWORDS
+    ]
+    result_tokens = [token for token in re.split(r"[^a-z0-9]+", result_text.lower()) if len(token) > 2]
+    if not query_tokens or not result_tokens:
+        return False
+    candidate_query = "".join(query_tokens[:2])
+    for window_size in {1, 2}:
+        for idx in range(0, max(0, len(result_tokens) - window_size + 1)):
+            candidate_result = "".join(result_tokens[idx : idx + window_size])
+            if SequenceMatcher(None, candidate_query, candidate_result).ratio() >= 0.86:
+                return True
+    return False
+
+
 def _result_is_relevant(item: dict[str, Any]) -> bool:
     query = str(item.get("query") or "")
     title = str(item.get("title") or "")
@@ -187,6 +232,8 @@ def _result_is_relevant(item: dict[str, Any]) -> bool:
     first_query_token = next(iter(_meaningful_tokens(query.split()[0] if query.split() else "")), "")
     if first_query_token and first_query_token in result_tokens:
         return True
+    if evidence_type in {"website", "news", "business_model", "leadership", "funding"} and _fuzzy_query_entity_match(query, f"{title} {url} {snippet}"):
+        return True
     if evidence_type in {"market", "competitor"} and len(overlap) >= 2:
         return True
     if evidence_type in {"website", "news", "business_model", "leadership"} and len(overlap) >= 2:
@@ -194,6 +241,46 @@ def _result_is_relevant(item: dict[str, Any]) -> bool:
     if evidence_type == "funding" and len(overlap) >= 1 and any(hint in url.lower() for hint in FUNDING_DATABASE_DOMAINS):
         return True
     return False
+
+
+def _domain_matches(domain: str, patterns: tuple[str, ...]) -> bool:
+    return any(domain == pattern or domain.endswith(f".{pattern}") or pattern in domain for pattern in patterns if not pattern.startswith("."))
+
+
+def _domain_has_suffix(domain: str, suffix: str) -> bool:
+    return domain == suffix.removeprefix(".") or domain.endswith(suffix)
+
+
+def _is_tier_1_allowlisted(domain: str) -> bool:
+    return _domain_matches(domain, tuple(pattern for pattern in TIER_1_ALLOWLIST_DOMAINS if not pattern.startswith("."))) or any(
+        _domain_has_suffix(domain, suffix) for suffix in TIER_1_ALLOWLIST_DOMAINS if suffix.startswith(".")
+    )
+
+
+def _is_tier_2_allowlisted(domain: str) -> bool:
+    return _domain_matches(domain, TIER_2_ALLOWLIST_DOMAINS)
+
+
+def _is_low_quality_domain(domain: str, text: str) -> bool:
+    return any(marker in domain or marker in text for marker in LOW_QUALITY_DOMAINS) or any(term in text for term in CONTENT_FARM_TERMS)
+
+
+def _is_seo_or_listicle(text: str) -> bool:
+    return any(term in text for term in SEO_TERMS) or any(term in text for term in LISTICLE_TERMS)
+
+
+def _is_named_customer_case_study(title: str, url: str, evidence_type: str) -> bool:
+    text = f"{title} {url}".lower()
+    return evidence_type in {"news", "website", "business_model"} and any(term in text for term in ["case study", "customer story", "customers/"])
+
+
+def _source_quality_sort_key(item: EvidenceItem) -> tuple[int, int, float]:
+    quality_rank = {"high": 0, "medium": 1, "low": 2}
+    return (
+        int(item.get("source_tier", 3)),
+        quality_rank.get(str(item.get("source_quality", "medium")), 1),
+        -float(item.get("confidence", 0.5)),
+    )
 
 
 def is_company_source(evidence_type: str, title: str, url: str) -> bool:
@@ -213,31 +300,35 @@ def is_tier_1_company_website(title: str, url: str, evidence_type: str) -> bool:
     return any(term in text for term in ["official", "about", "company", "homepage"])
 
 
-def source_quality(title: str, url: str, confidence: float) -> tuple[str, str]:
+def source_quality(title: str, url: str, evidence_type: str, confidence: float) -> tuple[str, str]:
     domain = urlparse(url).netloc.lower()
     text = f"{title} {url}".lower()
-    if any(domain.endswith(preferred) or preferred in domain for preferred in TIER_1_INSTITUTIONAL_DOMAINS):
-        return "high", "Preferred source domain."
+    if _is_seo_or_listicle(text):
+        return "low", "SEO/listicle source; use only as weak context or competitor discovery."
+    if _is_low_quality_domain(domain, text):
+        return "low", "Low-quality, social, review, forum, or content-farm source; use only as weak context."
+    if is_tier_1_company_website(title, url, evidence_type) or _is_tier_1_allowlisted(domain) or _is_named_customer_case_study(title, url, evidence_type):
+        return "high", "Tier 1 allowlisted source."
+    if _is_tier_2_allowlisted(domain):
+        return "medium", "Tier 2 allowlisted source."
     if confidence < 0.45:
         return "low", "Search confidence below threshold."
-    if any(marker in domain or marker in text for marker in LOW_QUALITY_DOMAINS):
-        return "low", "Likely blog/SEO source; use only if better evidence is unavailable."
-    if any(term in text for term in LISTICLE_TERMS):
-        return "low", "Potential SEO/listicle source; use only for directional context."
-    return "medium", "Usable public source; verify key claims during diligence."
+    return "medium", "Unlisted source; usable only with diligence verification."
 
 
 def source_tier(title: str, url: str, evidence_type: str, confidence: float) -> tuple[int, float, str]:
     domain = urlparse(url).netloc.lower()
     text = f"{title} {url}".lower()
-    if any(term in text for term in LISTICLE_TERMS):
-        return 3, 0.2, "Tier 3: Supplemental"
-    if is_tier_1_company_website(title, url, evidence_type) or any(preferred in domain for preferred in TIER_1_INSTITUTIONAL_DOMAINS):
-        return 1, 1.0, "Tier 1: Primary / Institutional"
-    if any(domain_hint in domain for domain_hint in TIER_2_DOMAINS) or any(term in text for term in ["analyst", "interview", "podcast", "industry report"]):
-        return 2, 0.6, "Tier 2: Secondary Expert"
-    if confidence < 0.45 or any(marker in domain or marker in text for marker in LOW_QUALITY_DOMAINS):
-        return 3, 0.2, "Tier 3: Supplemental"
+    if _is_seo_or_listicle(text) or _is_low_quality_domain(domain, text) or confidence < 0.45:
+        return 3, 0.2, "Tier 3: Low trust / context only"
+    if (
+        is_tier_1_company_website(title, url, evidence_type)
+        or _is_tier_1_allowlisted(domain)
+        or _is_named_customer_case_study(title, url, evidence_type)
+    ):
+        return 1, 1.0, "Tier 1: Highest trust"
+    if _is_tier_2_allowlisted(domain) or any(term in text for term in ["analyst", "interview", "podcast", "industry report", "trade publication"]):
+        return 2, 0.6, "Tier 2: Medium trust"
     return 2, 0.6, "Tier 2: Secondary Expert"
 
 
@@ -256,9 +347,11 @@ def source_reliability_policy(title: str, url: str, evidence_type: str, confiden
         source_type = "customer_case_study"
     elif any(domain_hint in domain for domain_hint in WIRE_DOMAINS):
         source_type = "company_owned"
+    elif _is_seo_or_listicle(text) and evidence_type == "competitor":
+        source_type = "vendor_blog"
     elif any(term in text for term in VENDOR_COMPARISON_TERMS) and evidence_type == "competitor":
         source_type = "vendor_blog"
-    elif confidence < 0.45 or any(marker in domain or marker in text for marker in LOW_QUALITY_DOMAINS) or any(term in text for term in SEO_TERMS):
+    elif confidence < 0.45 or _is_low_quality_domain(domain, text) or _is_seo_or_listicle(text):
         source_type = "generic_blog"
     elif any(domain_hint in domain for domain_hint in REPUTABLE_NEWS_DOMAINS):
         source_type = "independent_news"
@@ -295,15 +388,16 @@ def normalize_evidence(items: list[dict[str, Any]]) -> list[EvidenceItem]:
         seen.add(key)
 
         confidence = float(item.get("confidence", 0.5))
-        quality, quality_notes = source_quality(title, url, confidence)
-        tier, weight, tier_label = source_tier(title, url, str(item.get("evidence_type", "news")), confidence)
-        reliability = source_reliability_policy(title, url, str(item.get("evidence_type", "news")), confidence)
+        evidence_type = str(item.get("evidence_type", "news"))
+        quality, quality_notes = source_quality(title, url, evidence_type, confidence)
+        tier, weight, tier_label = source_tier(title, url, evidence_type, confidence)
+        reliability = source_reliability_policy(title, url, evidence_type, confidence)
         if quality == "low" and any(existing["evidence_type"] == item.get("evidence_type", "news") and existing.get("source_quality") != "low" for existing in evidence):
             continue
 
         evidence.append(
             {
-                "source_id": f"S{len(evidence) + 1}",
+                "source_id": "",
                 "title": title,
                 "url": url,
                 "snippet": str(item.get("snippet") or item.get("content") or "").strip(),
@@ -320,7 +414,14 @@ def normalize_evidence(items: list[dict[str, Any]]) -> list[EvidenceItem]:
             }
         )
 
-    return evidence
+    sorted_evidence = sorted(evidence, key=_source_quality_sort_key)
+    return [
+        {
+            **item,
+            "source_id": f"S{index + 1}",
+        }
+        for index, item in enumerate(sorted_evidence)
+    ]
 
 
 def mock_search(research_plan: list[ResearchQuery]) -> list[dict[str, Any]]:

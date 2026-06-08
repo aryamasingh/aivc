@@ -106,6 +106,68 @@ def render_research_status(state: dict, provider: str) -> None:
     )
 
 
+def _partner_competition_rows(state: dict, limit: int = 4) -> list[dict]:
+    table = state.get("chart_data", {}).get("competitive_table", [])
+    rows = [
+        row
+        for row in table
+        if row.get("competitor_score") is not None
+        and str(row.get("company", "")).strip()
+        and "could not be confidently" not in str(row.get("company", "")).lower()
+    ]
+    tier_order = {
+        "Direct / high similarity": 0,
+        "Adjacent / medium similarity": 1,
+        "Incumbent or replacement workflow": 2,
+        "Requires validation": 3,
+    }
+    rows = sorted(
+        rows,
+        key=lambda row: (tier_order.get(row.get("similarity_tier", "Requires validation"), 3), -row.get("competitor_score", 0)),
+    )
+    return rows[:limit]
+
+
+def _competition_diligence_question(state: dict, rows: list[dict]) -> str:
+    memo = state["memo_json"]
+    company = memo.get("company", "the company")
+    understanding = memo.get("company_understanding", {})
+    workflow = understanding.get("core_workflow", "the target workflow")
+    replacement = rows[0].get("replacement_target") if rows else "the incumbent workflow"
+    names = ", ".join(row.get("company", "") for row in rows[:3] if row.get("company")) or "the most relevant alternatives"
+    return (
+        f"Validate which alternative buyers are replacing today ({replacement}) and why {company} wins the {workflow} budget versus {names}."
+    )
+
+
+def _compact_competition_reason(row: dict) -> str:
+    category = str(row.get("category", ""))
+    tier = str(row.get("similarity_tier", "Requires validation"))
+    if category:
+        return f"{tier}; {category}."
+    return f"{tier}; requires validation."
+
+
+def _compact_replacement_target(row: dict) -> str:
+    target = str(row.get("replacement_target", "Requires validation."))
+    replacements = [
+        ("existing docs, wikis, project-management tools, productivity suites, and manual Slack/email/spreadsheet workflows", "docs/wikis, productivity suites, PM tools, manual Slack/email/spreadsheets"),
+        ("existing design, prototyping, whiteboarding, developer-handoff, and product-collaboration tools", "design/prototyping, whiteboarding, handoff, product-collaboration tools"),
+    ]
+    for long, short in replacements:
+        target = target.replace(long, short)
+    return target
+
+
+def _evidence_display_sort_key(item: dict) -> tuple[int, int, float]:
+    quality_rank = {"high": 0, "medium": 1, "low": 2}
+    return (
+        int(item.get("source_tier", 3)),
+        quality_rank.get(str(item.get("source_quality", "medium")), 1),
+        -float(item.get("confidence", 0.5)),
+    )
+
+
 def build_partner_memo_markdown(state: dict) -> str:
     memo = state["memo_json"]
     executive = memo.get("executive_summary", {})
@@ -128,6 +190,22 @@ def build_partner_memo_markdown(state: dict) -> str:
         lines.append(_claim_line(claim))
     lines.append("")
 
+    lines.extend(["## Founding Team", ""])
+    founding_team = memo.get("founding_team", {})
+    people = founding_team.get("people", [])
+    if people:
+        for person in people[:4]:
+            sources = ", ".join(person.get("source_ids", []))
+            source_label = f" [{sources}]" if sources else " [Notes]"
+            verification = person.get("verification_status", "Requires verification")
+            lines.append(
+                f"- {person.get('name', 'Unknown')}: {person.get('role', 'Leadership')} "
+                f"({verification}; {person.get('confidence', 'Low')} confidence){source_label}"
+            )
+    else:
+        lines.append("- Unknown. No founder/founding-team name was identified in current partner notes or public leadership evidence.")
+    lines.append("")
+
     lines.extend(["## Why Now", ""])
     lines.append(f"- {thesis.get('why_now', {}).get('answer', 'Timing requires diligence.')}")
     lines.append("")
@@ -148,11 +226,33 @@ def build_partner_memo_markdown(state: dict) -> str:
     lines.append("")
 
     lines.extend(["## Competition Summary", ""])
-    landscape = memo.get("competitive_landscape", {})
-    lines.append(f"- {landscape.get('summary', 'Competition requires diligence.')}")
-    for row in landscape.get("rows", [])[:4]:
-        examples = ", ".join(row.get("examples", [])[:3]) or "examples require validation"
-        lines.append(f"- {row.get('competitor_group', '')}: {examples}. {row.get('why_it_competes', '')}")
+    rows = _partner_competition_rows(state)
+    direct_names = ", ".join(row.get("company", "") for row in rows[:4] if row.get("company")) or "requires validation"
+    lines.append(f"- **Direct competitors:** {direct_names}.")
+    lines.append("")
+    lines.append("| Similarity | Competitor | Differentiation Factors | Funding / Scale | Revenue Evidence |")
+    lines.append("| --- | --- | --- | --- | --- |")
+    if rows:
+        for row in rows:
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        _compact_competition_reason(row),
+                        str(row.get("company", "")),
+                        str(row.get("differentiation_factors", "Requires validation.")),
+                        str(row.get("funding_info", "Requires validation.")),
+                        str(row.get("revenue_available", "Requires validation.")),
+                    ]
+                )
+                + " |"
+            )
+    else:
+        lines.append("| Requires validation | Relevant competitors could not be confidently identified from current evidence. | Requires validation. | Requires validation. | Requires validation. |")
+    lines.append("")
+    if rows:
+        lines.append(f"**Replacement target:** {_compact_replacement_target(rows[0])}")
+    lines.append(f"**Key diligence question:** {_competition_diligence_question(state, rows)}")
     lines.append("")
 
     lines.extend(["## Key Risks", ""])
@@ -265,7 +365,7 @@ if generate:
         st.markdown(memo_markdown)
 
     with evidence_tab:
-        evidence = state["evidence"]
+        evidence = sorted(state["evidence"], key=_evidence_display_sort_key)
         memo = state["memo_json"]
         chart_data = state["chart_data"]
         if evidence:
